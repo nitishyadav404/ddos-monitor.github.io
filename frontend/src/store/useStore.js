@@ -1,101 +1,111 @@
 import { create } from 'zustand'
-import { subscribeWithSelector } from 'zustand/middleware'
-import { ATTACK_TYPES, SEVERITY_LEVELS, SPEED_SETTINGS } from '../utils/constants.js'
+import { ATTACK_TYPES, SEVERITY_LEVELS, MAX_ATTACKS_IN_STORE } from '../utils/constants.js'
 
-const useStore = create(
-  subscribeWithSelector((set, get) => ({
-    // --- Globe state ---
-    globeView: 'globe',       // 'globe' | 'flat'
-    colorMode: 'color',       // 'color' | 'mono'
-    heatmapActive: false,
-    demoMode: false,
-    zoomLevel: 1.5,
-    selectedCountry: null,
-    hoveredArc: null,
+const useStore = create((set, get) => ({
+  // ---- Globe state ----
+  globeView:     '3d',       // '3d' | 'flat'
+  colorMode:     'color',    // 'color' | 'mono'
+  heatmapActive: false,
+  isRotating:    true,
 
-    // --- Attacks ---
-    attacks: [],              // live attack queue (max 100)
-    dailyCount: 0,
-    dailyCountByType: {},
-    last24hHistory: [],       // [{time, count}]
-    topTargetCountries: [],
-    topSourceCountries: [],
-    attackTypeDistribution: {},
-    protocolDistribution: {},
-    countryDetails: {},       // cache: countryCode -> details
+  // ---- Panel visibility ----
+  leftPanelOpen:   true,
+  rightPanelOpen:  true,
+  statsPanelOpen:  false,
+  countryDetailOpen: false,
 
-    // --- Filters ---
-    selectedTypes: Object.keys(ATTACK_TYPES),   // all selected by default
-    selectedSeverities: Object.keys(SEVERITY_LEVELS),
+  // ---- Live attacks (ring buffer) ----
+  attacks:      [],
+  dailyCount:   0,
+  yesterdayCount: null,
+  percentChange:  null,
 
-    // --- Feed control ---
-    feedSpeed: 'realtime',    // 'slow'|'medium'|'fast'|'realtime'
-    feedPaused: false,
+  // ---- Filters ----
+  selectedTypes:      [...ATTACK_TYPES],
+  selectedSeverities: [...SEVERITY_LEVELS].map(s => s.toLowerCase()),
+  speedLevel:         1,   // index into SPEED_LEVELS
+  demoMode:           false,
 
-    // --- WebSocket ---
-    wsStatus: 'disconnected', // 'connected'|'connecting'|'disconnected'
+  // ---- Country panel ----
+  topTargetCountries: [],
+  topSourceCountries: [],
+  selectedCountry:    null,
 
-    // --- Panels ---
-    leftPanelOpen: true,
-    rightPanelOpen: true,
-    statsPanelOpen: false,
-    countryDetailOpen: false,
+  // ---- Stats panel ----
+  last24hHistory:           [],
+  attackTypeDistribution:   [],
+  protocolDistribution:     [],
 
-    // ACTIONS
-    setGlobeView: (v) => set({ globeView: v }),
-    setColorMode: (m) => set({ colorMode: m }),
-    toggleHeatmap: () => set((s) => ({ heatmapActive: !s.heatmapActive })),
-    toggleDemoMode: () => set((s) => ({ demoMode: !s.demoMode })),
-    setZoomLevel: (z) => set({ zoomLevel: z }),
-    setSelectedCountry: (c) => set({ selectedCountry: c, countryDetailOpen: !!c }),
-    setHoveredArc: (a) => set({ hoveredArc: a }),
+  // ---- Tooltip ----
+  hoveredArc: null,
 
-    addAttack: (attack) => set((s) => {
-      const newAttacks = [attack, ...s.attacks].slice(0, 100)
-      const newCount = s.dailyCount + 1
-      const byType = { ...s.dailyCountByType }
-      byType[attack.type] = (byType[attack.type] || 0) + 1
-      return { attacks: newAttacks, dailyCount: newCount, dailyCountByType: byType }
-    }),
+  // ---- WebSocket status ----
+  wsStatus: 'connecting',   // 'connecting' | 'live' | 'reconnecting' | 'offline'
 
-    setDailyCount: (n) => set({ dailyCount: n }),
-    setDailyCountByType: (d) => set({ dailyCountByType: d }),
-    setLast24hHistory: (h) => set({ last24hHistory: h }),
-    setTopTargetCountries: (t) => set({ topTargetCountries: t }),
-    setTopSourceCountries: (s) => set({ topSourceCountries: s }),
-    setAttackTypeDistribution: (d) => set({ attackTypeDistribution: d }),
-    setProtocolDistribution: (d) => set({ protocolDistribution: d }),
-    setCountryDetails: (code, details) =>
-      set((s) => ({ countryDetails: { ...s.countryDetails, [code]: details } })),
+  // ================================================================
+  // ACTIONS
+  // ================================================================
 
-    setSelectedTypes: (types) => set({ selectedTypes: types }),
-    toggleType: (type) => set((s) => {
-      const types = s.selectedTypes.includes(type)
-        ? s.selectedTypes.filter((t) => t !== type)
-        : [...s.selectedTypes, type]
-      return { selectedTypes: types }
-    }),
-    setSelectedSeverities: (sev) => set({ selectedSeverities: sev }),
-    toggleSeverity: (sev) => set((s) => {
-      const sevs = s.selectedSeverities.includes(sev)
-        ? s.selectedSeverities.filter((v) => v !== sev)
-        : [...s.selectedSeverities, sev]
-      return { selectedSeverities: sevs }
-    }),
-    selectAllTypes: () => set({ selectedTypes: Object.keys(ATTACK_TYPES) }),
-    clearAllTypes: () => set({ selectedTypes: [] }),
+  addAttack: (attack) => set((state) => {
+    const attacks = [attack, ...state.attacks].slice(0, MAX_ATTACKS_IN_STORE)
+    return { attacks, dailyCount: state.dailyCount + 1 }
+  }),
 
-    setFeedSpeed: (spd) => set({ feedSpeed: spd }),
-    setFeedPaused: (p) => set({ feedPaused: p }),
-    setWsStatus: (st) => set({ wsStatus: st }),
+  addAttacks: (batch) => set((state) => {
+    const attacks = [...batch, ...state.attacks].slice(0, MAX_ATTACKS_IN_STORE)
+    return { attacks }
+  }),
 
-    toggleLeftPanel: () => set((s) => ({ leftPanelOpen: !s.leftPanelOpen })),
-    toggleRightPanel: () => set((s) => ({ rightPanelOpen: !s.rightPanelOpen })),
-    toggleStatsPanel: () => set((s) => ({ statsPanelOpen: !s.statsPanelOpen })),
-    closeCountryDetail: () => set({ countryDetailOpen: false, selectedCountry: null }),
+  setDailyCount:   (n)  => set({ dailyCount: n }),
+  setYesterdayCount: (n) => set({ yesterdayCount: n }),
+  setPercentChange:  (n) => set({ percentChange: n }),
 
-    resetDailyCount: () => set({ dailyCount: 0, dailyCountByType: {} }),
-  }))
-)
+  setGlobeView:     (v)  => set({ globeView: v }),
+  setColorMode:     (m)  => set({ colorMode: m }),
+  toggleHeatmap:    ()   => set((s) => ({ heatmapActive: !s.heatmapActive })),
+  toggleRotation:   ()   => set((s) => ({ isRotating: !s.isRotating })),
+
+  toggleLeftPanel:  ()   => set((s) => ({ leftPanelOpen:  !s.leftPanelOpen  })),
+  toggleRightPanel: ()   => set((s) => ({ rightPanelOpen: !s.rightPanelOpen })),
+  toggleStatsPanel: ()   => set((s) => ({ statsPanelOpen: !s.statsPanelOpen })),
+
+  setCountryDetailOpen: (v) => set({ countryDetailOpen: v }),
+  setSelectedCountry:   (c) => set({ selectedCountry: c, countryDetailOpen: !!c }),
+
+  setTopTargetCountries:   (d) => set({ topTargetCountries: d }),
+  setTopSourceCountries:   (d) => set({ topSourceCountries: d }),
+  setLast24hHistory:       (d) => set({ last24hHistory: d }),
+  setAttackTypeDistribution: (d) => set({ attackTypeDistribution: d }),
+  setProtocolDistribution:   (d) => set({ protocolDistribution: d }),
+
+  setHoveredArc: (arc) => set({ hoveredArc: arc }),
+  setWsStatus:   (s)   => set({ wsStatus: s }),
+
+  toggleType: (type) => set((state) => {
+    const has = state.selectedTypes.includes(type)
+    return {
+      selectedTypes: has
+        ? state.selectedTypes.filter((t) => t !== type)
+        : [...state.selectedTypes, type],
+    }
+  }),
+
+  toggleSeverity: (sev) => set((state) => {
+    const key = sev.toLowerCase()
+    const has = state.selectedSeverities.includes(key)
+    return {
+      selectedSeverities: has
+        ? state.selectedSeverities.filter((s) => s !== key)
+        : [...state.selectedSeverities, key],
+    }
+  }),
+
+  setSpeedLevel: (i) => set({ speedLevel: i }),
+  setDemoMode:   (v) => set({ demoMode: v }),
+
+  selectAllTypes:    () => set({ selectedTypes: [...ATTACK_TYPES] }),
+  clearAllTypes:     () => set({ selectedTypes: [] }),
+  selectAllSeverities: () => set({ selectedSeverities: SEVERITY_LEVELS.map(s=>s.toLowerCase()) }),
+}))
 
 export default useStore

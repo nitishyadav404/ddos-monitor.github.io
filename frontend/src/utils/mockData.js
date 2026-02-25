@@ -1,112 +1,87 @@
-import { ATTACK_TYPES, SEVERITY_LEVELS, COUNTRIES, COUNTRY_CODES } from './constants.js'
+import { ATTACK_TYPES, ATTACK_TYPE_COLORS, COUNTRIES, SEVERITY_LEVELS } from './constants.js'
 
-const rng = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min
-const pick = (arr) => arr[Math.floor(Math.random() * arr.length)]
-const pickTwo = (arr) => {
-  const a = pick(arr)
-  let b = pick(arr)
-  while (b === a) b = pick(arr)
-  return [a, b]
-}
+const COUNTRY_CODES = Object.keys(COUNTRIES)
 
-let attackIdCounter = 1
+function randomItem(arr) { return arr[Math.floor(Math.random() * arr.length)] }
+function randomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min }
 
-export function generateAttack() {
-  const [srcCode, tgtCode] = pickTwo(COUNTRY_CODES)
+let _id = 1
+
+export function generateDemoAttack() {
+  const srcCode = randomItem(COUNTRY_CODES)
+  let tgtCode   = randomItem(COUNTRY_CODES)
+  while (tgtCode === srcCode) tgtCode = randomItem(COUNTRY_CODES)
+
   const src = COUNTRIES[srcCode]
   const tgt = COUNTRIES[tgtCode]
-  const typeKey = pick(Object.keys(ATTACK_TYPES))
-  const sevKey = pick(['critical', 'critical', 'high', 'high', 'medium', 'medium', 'low'])
-  const type = ATTACK_TYPES[typeKey]
-  const sev = SEVERITY_LEVELS[sevKey]
+  const type     = randomItem(ATTACK_TYPES)
+  const severity = randomItem(SEVERITY_LEVELS)
 
   return {
-    id: `atk-${Date.now()}-${attackIdCounter++}`,
-    sourceCountry: srcCode,
-    targetCountry: tgtCode,
-    sourceName: src.name,
-    targetName: tgt.name,
-    sourceFlag: src.flag,
-    targetFlag: tgt.flag,
-    sourceLat: src.lat + (Math.random() - 0.5) * 3,
-    sourceLng: src.lng + (Math.random() - 0.5) * 3,
-    targetLat: tgt.lat + (Math.random() - 0.5) * 3,
-    targetLng: tgt.lng + (Math.random() - 0.5) * 3,
-    type: typeKey,
-    typeName: type.label,
-    typeColor: type.color,
-    severity: sevKey,
-    severityLabel: sev.label,
-    severityColor: sev.color,
-    volume: rng(100, 500000),
-    timestamp: new Date().toISOString(),
-    confidence: rng(60, 99),
+    id:            `demo-${_id++}`,
+    source_country: srcCode,
+    sourceLat:     src.lat + (Math.random() - 0.5) * 4,
+    sourceLng:     src.lng + (Math.random() - 0.5) * 4,
+    target_country: tgtCode,
+    targetLat:     tgt.lat + (Math.random() - 0.5) * 4,
+    targetLng:     tgt.lng + (Math.random() - 0.5) * 4,
+    type,
+    typeColor:     ATTACK_TYPE_COLORS[type],
+    severity:      severity.toLowerCase(),
+    confidence:    randomInt(65, 99),
+    timestamp:     new Date().toISOString(),
+    data_source:   'demo',
   }
 }
 
-export function generateDemoAttacks(count = 20) {
-  return Array.from({ length: count }, generateAttack)
+export function generateDemoAttacks(n = 20) {
+  return Array.from({ length: n }, generateDemoAttack)
 }
 
-export function generateTopCountries(isTarget = true) {
-  return COUNTRY_CODES.slice(0, 10).map((code, i) => ({
-    code,
-    name: COUNTRIES[code].name,
-    flag: COUNTRIES[code].flag,
-    count: rng(5000, 80000) - i * 3000,
-    primaryType: pick(Object.keys(ATTACK_TYPES)),
-    trend: pick(['up', 'down', 'up', 'stable']),
-  })).sort((a, b) => b.count - a.count)
+export function generateTopCountries(asTarget = true) {
+  const shuffled = [...COUNTRY_CODES].sort(() => Math.random() - 0.5).slice(0, 10)
+  return shuffled.map((code, i) => ({
+    rank: i + 1,
+    country_code: code,
+    country_name: COUNTRIES[code].name,
+    count: randomInt(1200 - i * 100, 3000 - i * 150),
+    primary_attack_type: randomItem(ATTACK_TYPES),
+    lat: COUNTRIES[code].lat,
+    lng: COUNTRIES[code].lng,
+  }))
 }
 
 export function generateLast24hHistory() {
-  const now = new Date()
-  return Array.from({ length: 48 }, (_, i) => {
-    const t = new Date(now.getTime() - (47 - i) * 30 * 60 * 1000)
+  const now = Date.now()
+  return Array.from({ length: 288 }, (_, i) => ({
+    timestamp_utc: new Date(now - (287 - i) * 5 * 60 * 1000).toISOString(),
+    count: randomInt(50, 400) + (i > 240 ? randomInt(0, 200) : 0),
+  }))
+}
+
+export function generateAttackTypeDistribution() {
+  const total = 10000
+  let remaining = total
+  return ATTACK_TYPES.map((type, i) => {
+    const count = i === ATTACK_TYPES.length - 1
+      ? remaining
+      : randomInt(200, Math.floor(remaining / (ATTACK_TYPES.length - i)))
+    remaining -= count
     return {
-      time: t.toISOString(),
-      label: `${t.getUTCHours().toString().padStart(2, '0')}:${t.getUTCMinutes().toString().padStart(2, '0')}`,
-      count: rng(200, 2500),
+      attack_type: type,
+      count,
+      percentage: parseFloat(((count / total) * 100).toFixed(1)),
+      color: ATTACK_TYPE_COLORS[type],
     }
   })
 }
 
-export function generateAttackTypeDistribution() {
-  const dist = {}
-  Object.keys(ATTACK_TYPES).forEach((k) => { dist[k] = rng(500, 20000) })
-  return dist
-}
-
 export function generateProtocolDistribution() {
-  return {
-    TCP: rng(10000, 50000),
-    UDP: rng(8000, 40000),
-    HTTP: rng(5000, 25000),
-    DNS: rng(3000, 15000),
-    NTP: rng(2000, 10000),
-    ICMP: rng(1000, 8000),
-    Other: rng(500, 3000),
-  }
-}
-
-export function generateCountryDetail(code) {
-  const country = COUNTRIES[code]
-  if (!country) return null
-  const history = generateLast24hHistory()
-  const total = rng(5000, 80000)
-  return {
-    code, ...country,
-    totalAttacks: total,
-    incoming: Math.floor(total * 0.65),
-    outgoing: Math.floor(total * 0.35),
-    topAttackTypes: Object.keys(ATTACK_TYPES).slice(0, 3).map((k) => ({
-      type: k, label: ATTACK_TYPES[k].label, count: rng(500, 15000),
-      color: ATTACK_TYPES[k].color,
-    })),
-    topSources: COUNTRY_CODES.filter((c) => c !== code).slice(0, 5).map((c) => ({
-      code: c, name: COUNTRIES[c].name, flag: COUNTRIES[c].flag, count: rng(200, 8000),
-    })),
-    vulnerabilityLevel: pick(['critical', 'high', 'medium', 'low']),
-    history,
-  }
+  return [
+    { protocol: 'SYN',  count: 3200, percentage: 32.0, color: '#bf5fff' },
+    { protocol: 'UDP',  count: 2800, percentage: 28.0, color: '#00ff88' },
+    { protocol: 'HTTP', count: 1900, percentage: 19.0, color: '#00d4ff' },
+    { protocol: 'DNS',  count: 1200, percentage: 12.0, color: '#ffd700' },
+    { protocol: 'ICMP', count:  900, percentage:  9.0, color: '#39ff14' },
+  ]
 }

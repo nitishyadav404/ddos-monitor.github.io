@@ -1,128 +1,119 @@
-import React, { useState } from 'react'
-import useStore from '../../store/useStore.js'
-import { ATTACK_TYPES } from '../../utils/constants.js'
-import { formatNumber } from '../../utils/formatters.js'
+import React from 'react'
+import { Doughnut, Line } from 'react-chartjs-2'
 import {
-  Chart as ChartJS, CategoryScale, LinearScale, BarElement, PointElement,
-  LineElement, ArcElement, Title, Tooltip, Legend, Filler
+  Chart as ChartJS, ArcElement, Tooltip, Legend,
+  CategoryScale, LinearScale, PointElement, LineElement, Filler,
 } from 'chart.js'
-import { Bar, Doughnut, Line } from 'react-chartjs-2'
-ChartJS.register(CategoryScale, LinearScale, BarElement, PointElement, LineElement, ArcElement, Title, Tooltip, Legend, Filler)
+import { X } from 'lucide-react'
+import useStore from '../../store/useStore.js'
 
-const CHART_FONT = { family: 'JetBrains Mono, monospace', size: 10 }
-const GRID_COLOR = 'rgba(255,255,255,0.05)'
-const TEXT_COLOR = '#6b7280'
-
-function TopCountriesChart({ data, title }) {
-  if (!data?.length) return null
-  const chartData = {
-    labels: data.slice(0, 8).map((c) => c.name.slice(0, 10)),
-    datasets: [{ data: data.slice(0, 8).map((c) => c.count), backgroundColor: '#00d4ff33', borderColor: '#00d4ff', borderWidth: 1, borderRadius: 3 }]
-  }
-  return (
-    <div className="h-full">
-      <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">{title}</div>
-      <Bar data={chartData} options={{
-        indexAxis: 'y', responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => ` ${formatNumber(c.raw)}` } } },
-        scales: {
-          x: { grid: { color: GRID_COLOR }, ticks: { color: TEXT_COLOR, font: CHART_FONT, callback: (v) => formatNumber(v) } },
-          y: { grid: { display: false }, ticks: { color: '#9ca3af', font: CHART_FONT } }
-        }
-      }} />
-    </div>
-  )
-}
-
-function AttackTypeDonut({ data }) {
-  const entries = Object.entries(data)
-  if (!entries.length) return null
-  const chartData = {
-    labels: entries.map(([k]) => ATTACK_TYPES[k]?.label || k),
-    datasets: [{
-      data: entries.map(([, v]) => v),
-      backgroundColor: entries.map(([k]) => (ATTACK_TYPES[k]?.color || '#00d4ff') + 'aa'),
-      borderColor: entries.map(([k]) => ATTACK_TYPES[k]?.color || '#00d4ff'),
-      borderWidth: 1,
-    }]
-  }
-  return (
-    <div className="h-full">
-      <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">Attack Types</div>
-      <Doughnut data={chartData} options={{
-        responsive: true, maintainAspectRatio: false,
-        plugins: {
-          legend: { position: 'right', labels: { color: '#9ca3af', font: CHART_FONT, boxWidth: 8, padding: 6 } },
-          tooltip: { callbacks: { label: (c) => ` ${c.label}: ${formatNumber(c.raw)}` } }
-        },
-        cutout: '65%'
-      }} />
-    </div>
-  )
-}
-
-function TimelineChart({ data }) {
-  if (!data?.length) return null
-  const chartData = {
-    labels: data.map((d) => d.label),
-    datasets: [{
-      data: data.map((d) => d.count),
-      borderColor: '#00d4ff',
-      backgroundColor: '#00d4ff11',
-      fill: true, tension: 0.4, pointRadius: 0,
-    }]
-  }
-  return (
-    <div className="h-full">
-      <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">24h Attack Timeline (GMT)</div>
-      <Line data={chartData} options={{
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false } },
-        scales: {
-          x: { grid: { color: GRID_COLOR }, ticks: { color: TEXT_COLOR, font: CHART_FONT, maxTicksLimit: 12 } },
-          y: { grid: { color: GRID_COLOR }, ticks: { color: TEXT_COLOR, font: CHART_FONT, callback: (v) => formatNumber(v) } }
-        }
-      }} />
-    </div>
-  )
-}
-
-const TABS = [
-  { key: 'timeline',  label: '24h Timeline' },
-  { key: 'types',     label: 'Attack Types' },
-  { key: 'targets',   label: 'Top Targets' },
-  { key: 'sources',   label: 'Top Sources' },
-]
+ChartJS.register(ArcElement, Tooltip, Legend, CategoryScale, LinearScale, PointElement, LineElement, Filler)
 
 export default function StatsPanel() {
   const {
-    last24hHistory, attackTypeDistribution, topTargetCountries, topSourceCountries
+    attackTypeDistribution, last24hHistory, protocolDistribution,
+    toggleStatsPanel,
   } = useStore()
-  const [tab, setTab] = useState('timeline')
+
+  // Doughnut: attack type
+  const doughnutData = {
+    labels: attackTypeDistribution.map((d) => d.attack_type),
+    datasets: [{
+      data: attackTypeDistribution.map((d) => d.count),
+      backgroundColor: attackTypeDistribution.map((d) => (d.color || '#00ff88') + 'cc'),
+      borderColor:     attackTypeDistribution.map((d) => d.color || '#00ff88'),
+      borderWidth: 1,
+    }],
+  }
+
+  // Line: 24h history
+  const lineLabels = last24hHistory
+    .filter((_, i) => i % 12 === 0)
+    .map((p) => new Date(p.timestamp_utc).getUTCHours() + ':00')
+  const lineData = {
+    labels: lineLabels,
+    datasets: [{
+      label: 'Attacks',
+      data: last24hHistory.filter((_, i) => i % 12 === 0).map((p) => p.count),
+      borderColor: '#00ff88',
+      backgroundColor: 'rgba(0,255,136,0.08)',
+      tension: 0.4,
+      fill: true,
+      pointRadius: 0,
+      borderWidth: 1.5,
+    }],
+  }
+
+  const chartOptions = (isLine = false) => ({
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: {
+        display: !isLine,
+        position: 'right',
+        labels: { color: '#00ff8888', font: { family: 'JetBrains Mono', size: 10 }, boxWidth: 10, padding: 6 },
+      },
+      tooltip: {
+        backgroundColor: 'rgba(6,15,8,0.95)',
+        titleColor: '#00ff88',
+        bodyColor: '#00ff8888',
+        borderColor: 'rgba(0,255,136,0.2)',
+        borderWidth: 1,
+        titleFont: { family: 'JetBrains Mono', size: 11 },
+        bodyFont:  { family: 'JetBrains Mono', size: 10 },
+      },
+    },
+    scales: isLine ? {
+      x: { ticks: { color: '#00ff8855', font: { family: 'JetBrains Mono', size: 9 } }, grid: { color: 'rgba(0,255,136,0.04)' } },
+      y: { ticks: { color: '#00ff8855', font: { family: 'JetBrains Mono', size: 9 } }, grid: { color: 'rgba(0,255,136,0.04)' } },
+    } : undefined,
+  })
 
   return (
-    <div className="flex flex-col h-full bg-space-800/90 border-t border-white/10">
-      {/* Tabs */}
-      <div className="flex border-b border-white/10 flex-shrink-0">
-        {TABS.map((t) => (
-          <button
-            key={t.key}
-            onClick={() => setTab(t.key)}
-            className={`px-4 py-1.5 text-[10px] font-medium uppercase tracking-widest transition-colors
-              ${ tab === t.key ? 'text-cyber-cyan border-b-2 border-cyber-cyan' : 'text-gray-500 hover:text-gray-300' }
-            `}
-          >
-            {t.label}
-          </button>
-        ))}
+    <div className="h-full flex panel-card border-t border-cyber-green/15 overflow-hidden">
+      {/* Header */}
+      <div className="flex flex-col justify-between py-3 px-3 border-r border-cyber-green/10">
+        <span className="font-mono text-xs text-cyber-green/60 uppercase tracking-wider [writing-mode:vertical-lr] rotate-180">
+          Stats Panel
+        </span>
+        <button onClick={toggleStatsPanel} className="text-cyber-green/30 hover:text-cyber-green transition-colors">
+          <X className="w-3.5 h-3.5" />
+        </button>
       </div>
 
-      {/* Chart Area */}
-      <div className="flex-1 px-6 py-3 overflow-hidden">
-        {tab === 'timeline' && <TimelineChart data={last24hHistory} />}
-        {tab === 'types'    && <AttackTypeDonut data={attackTypeDistribution} />}
-        {tab === 'targets'  && <TopCountriesChart data={topTargetCountries} title="Top 8 Targeted Countries" />}
-        {tab === 'sources'  && <TopCountriesChart data={topSourceCountries} title="Top 8 Source Countries" />}
+      {/* Charts */}
+      <div className="flex flex-1 gap-4 px-4 py-3 overflow-x-auto">
+        {/* Doughnut */}
+        <div className="flex flex-col flex-shrink-0" style={{ width: 220 }}>
+          <p className="font-mono text-xs text-cyber-green/40 uppercase mb-1">Attack Types</p>
+          <div className="flex-1" style={{ minHeight: 180 }}>
+            {attackTypeDistribution.length > 0 && <Doughnut data={doughnutData} options={chartOptions(false)} />}
+          </div>
+        </div>
+
+        {/* 24h Line */}
+        <div className="flex flex-col flex-1" style={{ minWidth: 280 }}>
+          <p className="font-mono text-xs text-cyber-green/40 uppercase mb-1">24h Activity</p>
+          <div className="flex-1" style={{ minHeight: 180 }}>
+            {last24hHistory.length > 0 && <Line data={lineData} options={chartOptions(true)} />}
+          </div>
+        </div>
+
+        {/* Protocol breakdown */}
+        <div className="flex flex-col flex-shrink-0" style={{ width: 180 }}>
+          <p className="font-mono text-xs text-cyber-green/40 uppercase mb-1">Protocols</p>
+          <div className="space-y-2 mt-1">
+            {protocolDistribution.map((p) => (
+              <div key={p.protocol} className="flex items-center gap-2">
+                <span className="font-mono text-xs w-10" style={{ color: p.color }}>{p.protocol}</span>
+                <div className="flex-1 h-1 bg-cyber-green/10 rounded-full overflow-hidden">
+                  <div className="h-full rounded-full transition-all" style={{ width:`${p.percentage}%`, background: p.color }} />
+                </div>
+                <span className="font-mono text-xs text-cyber-green/40">{p.percentage}%</span>
+              </div>
+            ))}
+          </div>
+        </div>
       </div>
     </div>
   )

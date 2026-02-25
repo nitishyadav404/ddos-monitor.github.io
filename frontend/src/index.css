@@ -1,70 +1,140 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;700&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-@layer base {
-  * { box-sizing: border-box; }
-  html { scroll-behavior: smooth; }
-  body {
-    background-color: #0a0e27;
-    color: #ffffff;
-    font-family: 'Inter', system-ui, sans-serif;
-    overflow: hidden;
-    height: 100vh;
-    width: 100vw;
-  }
-  #root {
-    height: 100vh;
-    width: 100vw;
-    overflow: hidden;
-  }
+/* ========================================================
+   BASE — deep hacker dark background
+   ======================================================== */
+:root {
+  --c-green:    #00ff88;
+  --c-green2:   #39ff14;
+  --c-purple:   #bf5fff;
+  --c-purple2:  #7928ca;
+  --c-cyan:     #00d4ff;
+  --c-red:      #ff3366;
+  --c-orange:   #ff6b35;
+  --c-yellow:   #ffd700;
+  --c-bg:       #030a05;
+  --c-panel:    rgba(6,15,8,0.92);
+  --c-border:   rgba(0,255,136,0.15);
+  --c-border-p: rgba(191,95,255,0.15);
 }
 
-@layer components {
-  .panel-glass {
-    @apply bg-space-600/80 backdrop-blur-sm border border-white/10 rounded-xl;
-  }
-  .btn-cyber {
-    @apply px-3 py-1.5 rounded-lg text-xs font-medium transition-all duration-200
-           border border-white/10 bg-space-500/60 hover:bg-space-400/80
-           hover:border-cyber-cyan/40 text-gray-300 hover:text-white;
-  }
-  .btn-cyber-active {
-    @apply border-cyber-cyan/60 bg-cyber-cyan/10 text-cyber-cyan;
-  }
-  .severity-critical { @apply text-red-400 bg-red-500/20 border-red-500/30; }
-  .severity-high     { @apply text-orange-400 bg-orange-500/20 border-orange-500/30; }
-  .severity-medium   { @apply text-yellow-400 bg-yellow-500/20 border-yellow-500/30; }
-  .severity-low      { @apply text-green-400 bg-green-500/20 border-green-500/30; }
-  .attack-badge {
-    @apply text-xs px-2 py-0.5 rounded-full font-mono font-medium border;
-  }
-  .scrollbar-cyber::-webkit-scrollbar { width: 4px; }
-  .scrollbar-cyber::-webkit-scrollbar-track { background: #0d1234; }
-  .scrollbar-cyber::-webkit-scrollbar-thumb { background: #00d4ff44; border-radius: 2px; }
-  .scrollbar-cyber::-webkit-scrollbar-thumb:hover { background: #00d4ff88; }
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
 }
 
-@layer utilities {
-  .text-glow-cyan { text-shadow: 0 0 10px #00d4ff, 0 0 20px #00d4ff55; }
-  .text-glow-red  { text-shadow: 0 0 10px #ff3366, 0 0 20px #ff336655; }
-  .border-glow    { box-shadow: 0 0 0 1px #00d4ff22, 0 0 10px #00d4ff11; }
-  .globe-container canvas { border-radius: 0 !important; }
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: var(--c-bg);
+  color: #c8ffd9;
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* Animated counter roll */
-.counter-digit {
-  display: inline-block;
-  transition: transform 0.3s ease-out, opacity 0.3s;
+/* ========================================================
+   SCROLLBARS — hacker green thin scrollbar
+   ======================================================== */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: rgba(0,0,0,0.3); }
+::-webkit-scrollbar-thumb { background: rgba(0,255,136,0.35); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0,255,136,0.6); }
+
+/* ========================================================
+   PANEL GLASS CARD
+   ======================================================== */
+.panel-card {
+  background: var(--c-panel);
+  border: 1px solid var(--c-border);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
 
-/* Speed knob */
-.knob-ring {
-  transition: stroke-dashoffset 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+.panel-card-purple {
+  background: rgba(10,5,18,0.92);
+  border: 1px solid var(--c-border-p);
+  backdrop-filter: blur(12px);
 }
 
-/* Attack arc glow */
-.arc-tooltip {
+/* ========================================================
+   TYPOGRAPHY UTILITIES
+   ======================================================== */
+.font-mono { font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+
+.text-glow-green  { text-shadow: 0 0 8px rgba(0,255,136,0.7); }
+.text-glow-purple { text-shadow: 0 0 8px rgba(191,95,255,0.7); }
+.text-glow-red    { text-shadow: 0 0 8px rgba(255,51,102,0.7); }
+
+/* ========================================================
+   SEVERITY BADGE COLOURS
+   ======================================================== */
+.badge-critical { background: rgba(255,51,102,0.15);  color: #ff3366; border: 1px solid rgba(255,51,102,0.3); }
+.badge-high     { background: rgba(255,107,53,0.15);  color: #ff6b35; border: 1px solid rgba(255,107,53,0.3); }
+.badge-medium   { background: rgba(255,215,0,0.12);   color: #ffd700; border: 1px solid rgba(255,215,0,0.25); }
+.badge-low      { background: rgba(0,255,136,0.1);    color: #00ff88; border: 1px solid rgba(0,255,136,0.2); }
+
+/* ========================================================
+   ATTACK TYPE CHIP COLOURS
+   ======================================================== */
+.type-syn      { color: #bf5fff; }
+.type-udp      { color: #00ff88; }
+.type-http     { color: #00d4ff; }
+.type-dns      { color: #ffd700; }
+.type-ntp      { color: #ff6b35; }
+.type-icmp     { color: #39ff14; }
+.type-vol      { color: #ff3366; }
+.type-bot      { color: #bf5fff; }
+
+/* ========================================================
+   GLOBE CONTAINER
+   ======================================================== */
+.globe-container canvas {
+  display: block;
+}
+
+/* ========================================================
+   SCAN LINE EFFECT (header / panels)
+   ======================================================== */
+.scan-effect::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0,0,0,0.03) 2px,
+    rgba(0,0,0,0.03) 4px
+  );
   pointer-events: none;
-  transition: opacity 0.2s;
 }
+
+/* ========================================================
+   COUNTER FLIP ANIMATION
+   ======================================================== */
+@keyframes countFlip {
+  0%   { opacity: 0; transform: translateY(8px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+.count-flip { animation: countFlip 0.25s ease-out; }
+
+/* ========================================================
+   NEON BORDER PULSE
+   ======================================================== */
+@keyframes borderPulse {
+  0%, 100% { border-color: rgba(0,255,136,0.2); }
+  50%       { border-color: rgba(0,255,136,0.5); }
+}
+.border-pulse { animation: borderPulse 3s ease-in-out infinite; }
+
+@keyframes borderPulsePurple {
+  0%, 100% { border-color: rgba(191,95,255,0.2); }
+  50%       { border-color: rgba(191,95,255,0.5); }
+}
+.border-pulse-purple { animation: borderPulsePurple 3s ease-in-out infinite; }

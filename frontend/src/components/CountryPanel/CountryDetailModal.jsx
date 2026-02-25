@@ -1,129 +1,119 @@
 import React, { useEffect, useState } from 'react'
+import { X, ArrowDownLeft, ArrowUpRight, AlertTriangle } from 'lucide-react'
+import { motion, AnimatePresence } from 'framer-motion'
 import useStore from '../../store/useStore.js'
-import { ATTACK_TYPES, SEVERITY_LEVELS } from '../../utils/constants.js'
-import { formatNumber } from '../../utils/formatters.js'
-import { generateCountryDetail } from '../../utils/mockData.js'
-import { X, Shield, ArrowDownLeft, ArrowUpRight } from 'lucide-react'
-import { Line } from 'react-chartjs-2'
-import {
-  Chart as ChartJS, CategoryScale, LinearScale, PointElement,
-  LineElement, Tooltip, Filler
-} from 'chart.js'
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler)
+import { formatCount } from '../../utils/formatters.js'
+import { ATTACK_TYPE_COLORS, SEVERITY_COLORS } from '../../utils/constants.js'
+
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
 export default function CountryDetailModal() {
-  const { selectedCountry, closeCountryDetail } = useStore()
-  const [detail, setDetail] = useState(null)
+  const { selectedCountry, setCountryDetailOpen } = useStore()
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    if (selectedCountry?.code) {
-      setDetail(generateCountryDetail(selectedCountry.code))
-    } else if (selectedCountry) {
-      setDetail(generateCountryDetail(Object.keys(require('../../utils/constants.js').COUNTRIES)[0]))
-    }
-  }, [selectedCountry])
+    if (!selectedCountry?.country_code) return
+    setLoading(true)
+    fetch(`${API_URL}/api/country/${selectedCountry.country_code}`)
+      .then((r) => r.json())
+      .then((d) => { setData(d); setLoading(false) })
+      .catch(() => setLoading(false))
+  }, [selectedCountry?.country_code])
 
-  if (!detail) return null
-  const sev = SEVERITY_LEVELS[detail.vulnerabilityLevel] || SEVERITY_LEVELS.medium
-
-  const chartData = {
-    labels: detail.history.map((h) => h.label),
-    datasets: [{
-      data: detail.history.map((h) => h.count),
-      borderColor: '#00d4ff',
-      backgroundColor: '#00d4ff11',
-      fill: true,
-      tension: 0.4,
-      pointRadius: 0,
-    }]
-  }
-  const chartOpts = {
-    responsive: true, maintainAspectRatio: false,
-    plugins: { legend: { display: false }, tooltip: { enabled: false } },
-    scales: {
-      x: { display: false },
-      y: { display: false, grid: { display: false } }
-    }
-  }
+  const close = () => setCountryDetailOpen(false)
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={closeCountryDetail}>
-      <div className="panel-glass w-full max-w-md mx-4 shadow-2xl animate-fade-in" onClick={(e) => e.stopPropagation()}>
-        {/* Header */}
-        <div className="flex items-center gap-3 px-5 py-4 border-b border-white/10">
-          <span className="text-3xl">{detail.flag}</span>
-          <div className="flex-1">
-            <h2 className="text-lg font-bold text-white">{detail.name}</h2>
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-gray-500">{detail.code}</span>
-              <span
-                className="attack-badge text-[10px]"
-                style={{ color: sev.color, background: sev.bg, borderColor: sev.border }}
-              >
-                <Shield size={9} className="inline mr-0.5" />{sev.label} Risk
-              </span>
+    <AnimatePresence>
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+        onClick={close}
+      >
+        <motion.div
+          initial={{ scale: 0.92, opacity: 0, y: 20 }}
+          animate={{ scale: 1, opacity: 1, y: 0 }}
+          exit={{ scale: 0.92, opacity: 0, y: 20 }}
+          transition={{ type: 'spring', damping: 20, stiffness: 300 }}
+          className="panel-card-purple rounded-xl w-full max-w-md border-pulse-purple"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* Header */}
+          <div className="flex items-center justify-between px-5 py-4 border-b border-cyber-purple/20">
+            <div>
+              <h2 className="font-mono text-lg font-bold text-cyber-purple text-glow-purple">
+                {selectedCountry?.country_code}
+              </h2>
+              <p className="font-mono text-xs text-cyber-purple/60">
+                {data?.country_name || selectedCountry?.country_name || 'Loading…'}
+              </p>
             </div>
+            <button onClick={close} className="text-cyber-purple/40 hover:text-cyber-purple transition-colors">
+              <X className="w-4 h-4" />
+            </button>
           </div>
-          <button onClick={closeCountryDetail} className="text-gray-500 hover:text-white">
-            <X size={16} />
-          </button>
-        </div>
 
-        <div className="p-5 space-y-4">
-          {/* Attack counts */}
-          <div className="grid grid-cols-3 gap-3">
-            <div className="text-center">
-              <div className="text-xl font-bold text-cyber-cyan font-mono">{formatNumber(detail.totalAttacks)}</div>
-              <div className="text-[10px] text-gray-500">Total</div>
+          {loading ? (
+            <div className="flex items-center justify-center h-32 font-mono text-xs text-cyber-purple/40">
+              Fetching data…
             </div>
-            <div className="text-center">
-              <div className="text-xl font-bold text-red-400 font-mono">{formatNumber(detail.incoming)}</div>
-              <div className="flex items-center justify-center gap-1 text-[10px] text-gray-500">
-                <ArrowDownLeft size={10} />Incoming
+          ) : (
+            <div className="px-5 py-4 space-y-4">
+              {/* Incoming / Outgoing */}
+              <div className="grid grid-cols-2 gap-3">
+                <StatCard icon={ArrowDownLeft} label="Incoming" value={formatCount(data?.incoming_today ?? 0)} color="#ff3366" />
+                <StatCard icon={ArrowUpRight}  label="Outgoing" value={formatCount(data?.outgoing_today ?? 0)} color="#00ff88" />
               </div>
-            </div>
-            <div className="text-center">
-              <div className="text-xl font-bold text-orange-400 font-mono">{formatNumber(detail.outgoing)}</div>
-              <div className="flex items-center justify-center gap-1 text-[10px] text-gray-500">
-                <ArrowUpRight size={10} />Outgoing
+
+              {/* Severity */}
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-3.5 h-3.5" style={{ color: SEVERITY_COLORS[data?.severity_level] || '#00ff88' }} />
+                <span className="font-mono text-xs text-cyber-purple/60">Severity Level:</span>
+                <span
+                  className="font-mono text-xs font-semibold"
+                  style={{ color: SEVERITY_COLORS[data?.severity_level] || '#00ff88' }}
+                >
+                  {data?.severity_level || 'Low'}
+                </span>
               </div>
-            </div>
-          </div>
 
-          {/* 24h mini chart */}
-          <div className="h-16">
-            <Line data={chartData} options={chartOpts} />
-          </div>
-
-          {/* Top attack types */}
-          <div>
-            <div className="text-[10px] text-gray-500 mb-2 uppercase tracking-widest">Top Attack Types</div>
-            {detail.topAttackTypes.map((t) => (
-              <div key={t.type} className="flex items-center gap-2 mb-1.5">
-                <span className="text-[10px] font-mono" style={{ color: t.color }}>{t.label}</span>
-                <div className="flex-1 bg-white/5 h-1 rounded-full overflow-hidden">
-                  <div className="h-full rounded-full" style={{ width: `${Math.min(100, (t.count / detail.incoming) * 100)}%`, background: t.color }} />
+              {/* Top Attack Types */}
+              {data?.top_attack_types?.length > 0 && (
+                <div>
+                  <p className="font-mono text-xs text-cyber-purple/40 uppercase mb-2">Top Attack Types</p>
+                  <div className="space-y-1.5">
+                    {data.top_attack_types.map((t) => (
+                      <div key={t.attack_type} className="flex items-center gap-2">
+                        <span className="font-mono text-xs w-32 truncate" style={{ color: ATTACK_TYPE_COLORS[t.attack_type] || '#00ff88' }}>
+                          {t.attack_type}
+                        </span>
+                        <div className="flex-1 h-1 bg-cyber-purple/10 rounded-full overflow-hidden">
+                          <div className="h-full rounded-full" style={{ width: `${t.percentage}%`, background: ATTACK_TYPE_COLORS[t.attack_type] || '#00ff88' }} />
+                        </div>
+                        <span className="font-mono text-xs text-cyber-purple/50">{t.percentage}%</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-                <span className="text-[10px] font-mono text-gray-400">{formatNumber(t.count)}</span>
-              </div>
-            ))}
-          </div>
-
-          {/* Top sources */}
-          <div>
-            <div className="text-[10px] text-gray-500 mb-2 uppercase tracking-widest">Top Attacking Sources</div>
-            <div className="space-y-1">
-              {detail.topSources.map((s) => (
-                <div key={s.code} className="flex items-center gap-2 text-xs">
-                  <span>{s.flag}</span>
-                  <span className="text-gray-300 flex-1">{s.name}</span>
-                  <span className="font-mono text-red-400">{formatNumber(s.count)}</span>
-                </div>
-              ))}
+              )}
             </div>
-          </div>
-        </div>
+          )}
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
+  )
+}
+
+function StatCard({ icon: Icon, label, value, color }) {
+  return (
+    <div className="rounded-lg p-3" style={{ background: color + '10', border: `1px solid ${color}30` }}>
+      <div className="flex items-center gap-1.5 mb-1">
+        <Icon className="w-3 h-3" style={{ color }} />
+        <span className="font-mono text-xs" style={{ color: color + 'aa' }}>{label}</span>
       </div>
+      <span className="font-mono text-lg font-bold" style={{ color }}>{value}</span>
     </div>
   )
 }

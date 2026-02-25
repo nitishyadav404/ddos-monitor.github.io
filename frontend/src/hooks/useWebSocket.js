@@ -1,84 +1,110 @@
 import { useEffect, useRef, useCallback } from 'react'
 import useStore from '../store/useStore.js'
-import { generateAttack } from '../utils/mockData.js'
-import { SPEED_SETTINGS } from '../utils/constants.js'
+import { normalizeAttack } from '../utils/formatters.js'
+import { WS_MSG } from '../utils/constants.js'
 
-const WS_URL = import.meta.env.VITE_WS_URL || null
+const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws/attacks'
+const RECONNECT_BASE_MS = 2000
+const RECONNECT_MAX_MS  = 30000
 
 export function useWebSocket() {
-  const wsRef = useRef(null)
-  const reconnectTimer = useRef(null)
-  const demoTimer = useRef(null)
+  const wsRef      = useRef(null)
+  const retryRef   = useRef(null)
+  const backoffRef = useRef(RECONNECT_BASE_MS)
+  const mountedRef = useRef(true)
+
   const {
-    addAttack, setWsStatus, demoMode, feedSpeed, feedPaused,
-    setDailyCount, setTopTargetCountries, setTopSourceCountries,
-    setLast24hHistory, setAttackTypeDistribution, setProtocolDistribution,
+    addAttack, addAttacks, setDailyCount, setYesterdayCount,
+    setPercentChange, setWsStatus, demoMode,
   } = useStore()
 
-  // Demo mode: generate synthetic attacks
-  const startDemo = useCallback(() => {
-    if (demoTimer.current) clearInterval(demoTimer.current)
-    const interval = SPEED_SETTINGS[feedSpeed]?.interval || 1000
-    demoTimer.current = setInterval(() => {
-      if (!feedPaused) {
-        const count = feedSpeed === 'realtime' ? 3 : feedSpeed === 'fast' ? 2 : 1
-        for (let i = 0; i < count; i++) addAttack(generateAttack())
-      }
-    }, interval)
-  }, [feedSpeed, feedPaused, addAttack])
+  const connect = useCallback(() => {
+    if (!mountedRef.current) return
+    if (demoMode) { setWsStatus('offline'); return }
 
-  const stopDemo = useCallback(() => {
-    if (demoTimer.current) { clearInterval(demoTimer.current); demoTimer.current = null }
-  }, [])
-
-  // Real WebSocket connection
-  const connectWS = useCallback(() => {
-    if (!WS_URL) return
     setWsStatus('connecting')
+
     try {
       const ws = new WebSocket(WS_URL)
       wsRef.current = ws
-      ws.onopen = () => setWsStatus('connected')
-      ws.onmessage = (e) => {
+
+      ws.onopen = () => {
+        if (!mountedRef.current) return
+        backoffRef.current = RECONNECT_BASE_MS
+        setWsStatus('live')
+        console.log('[WS] Connected to', WS_URL)
+      }
+
+      ws.onmessage = (event) => {
+        if (!mountedRef.current) return
         try {
-          const msg = JSON.parse(e.data)
-          if (msg.type === 'attack') addAttack(msg.data)
-          else if (msg.type === 'stats') {
-            if (msg.data.dailyCount) setDailyCount(msg.data.dailyCount)
-            if (msg.data.topTargets) setTopTargetCountries(msg.data.topTargets)
-            if (msg.data.topSources) setTopSourceCountries(msg.data.topSources)
-            if (msg.data.history) setLast24hHistory(msg.data.history)
-            if (msg.data.typeDistribution) setAttackTypeDistribution(msg.data.typeDistribution)
-            if (msg.data.protocolDistribution) setProtocolDistribution(msg.data.protocolDistribution)
+          const msg = JSON.parse(event.data)
+
+          switch (msg.type) {
+            case WS_MSG.CONNECTED:
+              // Hello frame — backend confirms connection
+              break
+
+            case WS_MSG.INITIAL_BATCH: {
+              // Last 100 attacks for fast page load
+              const attacks = (msg.attacks || []).map(normalizeAttack)
+              addAttacks(attacks)
+              break
+            }
+
+            case WS_MSG.ATTACK: {
+              // Single live attack event
+              const attack = normalizeAttack(msg.data || msg)
+              addAttack(attack)
+              break
+            }
+
+            default:
+              break
           }
-        } catch (_) {}
+        } catch (err) {
+          console.warn('[WS] Parse error:', err)
+        }
       }
-      ws.onerror = () => setWsStatus('disconnected')
+
+      ws.onerror = () => {
+        setWsStatus('reconnecting')
+      }
+
       ws.onclose = () => {
-        setWsStatus('disconnected')
-        reconnectTimer.current = setTimeout(connectWS, 3000)
+        if (!mountedRef.current) return
+        setWsStatus('reconnecting')
+        console.log(
+          `[WS] Disconnected. Reconnecting in ${backoffRef.current}ms…`
+        )
+        retryRef.current = setTimeout(() => {
+          backoffRef.current = Math.min(backoffRef.current * 2, RECONNECT_MAX_MS)
+          connect()
+        }, backoffRef.current)
       }
-    } catch (_) { setWsStatus('disconnected') }
-  }, [addAttack, setWsStatus, setDailyCount, setTopTargetCountries, setTopSourceCountries, setLast24hHistory, setAttackTypeDistribution, setProtocolDistribution])
+    } catch (err) {
+      console.error('[WS] Connection failed:', err)
+      setWsStatus('offline')
+    }
+  }, [demoMode, addAttack, addAttacks, setWsStatus])
 
   useEffect(() => {
-    if (demoMode || !WS_URL) {
-      startDemo()
-      setWsStatus('demo')
-    } else {
-      stopDemo()
-      connectWS()
-    }
+    mountedRef.current = true
+    connect()
     return () => {
-      stopDemo()
-      if (wsRef.current) wsRef.current.close()
-      if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
+      mountedRef.current = false
+      clearTimeout(retryRef.current)
+      wsRef.current?.close()
     }
-  }, [demoMode, WS_URL, connectWS, startDemo, stopDemo, setWsStatus])
+  }, [connect])
 
+  // Send a ping every 25s to keep WS alive through load balancers
   useEffect(() => {
-    if (demoMode || !WS_URL) startDemo()
-  }, [feedSpeed, feedPaused])
-
-  return null
+    const id = setInterval(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send('ping')
+      }
+    }, 25000)
+    return () => clearInterval(id)
+  }, [])
 }

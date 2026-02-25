@@ -1,39 +1,45 @@
 import React, { useState, useEffect } from 'react'
+import { Clock, Globe, Zap } from 'lucide-react'
 import useStore from '../../store/useStore.js'
-import { ATTACK_TYPES } from '../../utils/constants.js'
 
 export default function StatusBar() {
-  const { attacks, wsStatus, demoMode, selectedTypes } = useStore()
-  const [gmtTime, setGmtTime] = useState('')
+  const { attacks, wsStatus } = useStore()
+  const [utcTime, setUtcTime] = useState('')
 
   useEffect(() => {
     const tick = () => {
       const now = new Date()
-      setGmtTime(
-        now.toUTCString().replace('GMT', '').trim() + ' UTC'
+      setUtcTime(
+        now.toUTCString().replace('GMT', 'UTC').split(' ').slice(1).join(' ')
       )
     }
     tick()
-    const t = setInterval(tick, 1000)
-    return () => clearInterval(t)
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
   }, [])
 
-  const lastAttack = attacks[0]
+  const recentRate = attacks.length
+    ? `${Math.min(attacks.length, 100)} in buffer`
+    : 'No data'
 
   return (
-    <div className="flex-shrink-0 bg-space-950/90 border-t border-white/10 px-4 py-1 flex items-center gap-4 text-[10px] font-mono text-gray-500">
-      <span className="text-cyber-cyan">{gmtTime}</span>
-      <span className="w-px h-3 bg-white/10" />
-      {lastAttack && (
-        <span className="flex items-center gap-1">
-          <span className="inline-block w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: lastAttack.typeColor }} />
-          Last: {lastAttack.sourceFlag} {lastAttack.sourceName} → {lastAttack.targetFlag} {lastAttack.targetName} [{lastAttack.typeName}]
-        </span>
-      )}
-      <span className="ml-auto">
-        {demoMode && <span className="text-yellow-400 mr-3">[DEMO MODE]</span>}
-        Filters: {selectedTypes.length}/{Object.keys(ATTACK_TYPES).length} types active
-      </span>
-    </div>
+    <footer className="flex items-center justify-between px-4 py-1 border-t border-cyber-green/10 bg-space-950 flex-shrink-0" style={{ minHeight: 28 }}>
+      <div className="flex items-center gap-4">
+        <div className="flex items-center gap-1">
+          <Clock className="w-3 h-3 text-cyber-green/40" />
+          <span className="font-mono text-xs text-cyber-green/40">{utcTime}</span>
+        </div>
+        <div className="flex items-center gap-1">
+          <Globe className="w-3 h-3 text-cyber-green/40" />
+          <span className="font-mono text-xs text-cyber-green/40">
+            {wsStatus === 'live' ? '🟢 Live feed' : wsStatus === 'connecting' ? '🟡 Connecting…' : '🔴 Offline'}
+          </span>
+        </div>
+      </div>
+      <div className="flex items-center gap-1">
+        <Zap className="w-3 h-3 text-cyber-purple/50" />
+        <span className="font-mono text-xs text-cyber-purple/50">{recentRate}</span>
+      </div>
+    </footer>
   )
 }

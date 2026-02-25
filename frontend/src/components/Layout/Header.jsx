@@ -1,134 +1,63 @@
 import React from 'react'
+import { Shield, Wifi, WifiOff, Activity } from 'lucide-react'
 import useStore from '../../store/useStore.js'
-import { formatNumber, gmtTimeUntilReset } from '../../utils/formatters.js'
-import { ATTACK_TYPES } from '../../utils/constants.js'
-import {
-  Globe, Map, Activity, BarChart2, ChevronLeft, ChevronRight,
-  Radio, Layers, Eye, EyeOff, Play, Square, Wifi, WifiOff
-} from 'lucide-react'
+import { formatCount } from '../../utils/formatters.js'
 
 export default function Header() {
-  const {
-    globeView, setGlobeView, colorMode, setColorMode,
-    demoMode, toggleDemoMode, heatmapActive, toggleHeatmap,
-    dailyCount, dailyCountByType, wsStatus,
-    leftPanelOpen, toggleLeftPanel, rightPanelOpen, toggleRightPanel,
-    statsPanelOpen, toggleStatsPanel,
-  } = useStore()
+  const { dailyCount, yesterdayCount, wsStatus, demoMode, setDemoMode } = useStore()
 
-  const statusColor = wsStatus === 'connected' ? 'text-green-400' :
-                      wsStatus === 'demo' ? 'text-cyber-cyan' :
-                      wsStatus === 'connecting' ? 'text-yellow-400' : 'text-red-400'
-  const statusLabel = wsStatus === 'connected' ? 'LIVE' :
-                      wsStatus === 'demo' ? 'DEMO' :
-                      wsStatus === 'connecting' ? 'CONN…' : 'OFFLINE'
+  const statusConfig = {
+    live:         { icon: Wifi,    color: 'text-cyber-green',  label: 'LIVE',        dot: 'bg-cyber-green'  },
+    connecting:   { icon: Activity, color: 'text-cyber-yellow', label: 'CONNECTING',  dot: 'bg-cyber-yellow' },
+    reconnecting: { icon: Activity, color: 'text-cyber-orange', label: 'RECONNECTING',dot: 'bg-cyber-orange' },
+    offline:      { icon: WifiOff, color: 'text-gray-500',     label: 'OFFLINE',     dot: 'bg-gray-500'     },
+  }
+  const st = statusConfig[wsStatus] || statusConfig.offline
+  const StatusIcon = st.icon
 
   return (
-    <header className="flex-shrink-0 bg-space-800/95 backdrop-blur border-b border-white/10 px-4 py-2 flex items-center gap-3 z-20">
-      {/* Logo */}
-      <div className="flex items-center gap-2 mr-2">
-        <div className="w-7 h-7 rounded-lg bg-cyber-cyan/10 border border-cyber-cyan/40 flex items-center justify-center">
-          <Radio size={14} className="text-cyber-cyan" />
-        </div>
-        <div>
-          <div className="text-xs font-bold text-white leading-none">DDoS Monitor</div>
-          <div className="text-[9px] text-gray-500 font-mono">LIVE THREAT MAP</div>
-        </div>
+    <header className="flex items-center justify-between px-4 py-2 border-b border-cyber-green/20 bg-space-950 flex-shrink-0 scan-effect" style={{ minHeight: 48 }}>
+      {/* Left: Logo */}
+      <div className="flex items-center gap-2.5">
+        <Shield className="w-5 h-5 text-cyber-green animate-pulse-slow" />
+        <span className="font-mono text-sm font-bold text-cyber-green text-glow-green tracking-widest uppercase">
+          DDoS Monitor
+        </span>
+        <span className="font-mono text-xs text-cyber-green/40 hidden sm:block">v1.0</span>
       </div>
 
-      {/* Daily Counter */}
-      <div className="flex-1 flex items-center gap-4">
-        <div className="text-center">
-          <div className="text-2xl font-bold text-cyber-cyan font-mono text-glow-cyan leading-none">
-            {formatNumber(dailyCount)}
-          </div>
-          <div className="text-[9px] text-gray-500 uppercase tracking-widest">Attacks Today</div>
-        </div>
-
-        {/* Sub-counters */}
-        <div className="hidden xl:flex gap-2 flex-wrap">
-          {Object.entries(ATTACK_TYPES).slice(0, 4).map(([key, info]) => (
-            <div key={key} className="text-center">
-              <div className="text-xs font-mono font-semibold" style={{ color: info.color }}>
-                {formatNumber(dailyCountByType[key] || 0)}
-              </div>
-              <div className="text-[8px] text-gray-600">{info.label}</div>
-            </div>
-          ))}
-        </div>
-
-        <div className="text-[9px] text-gray-600 hidden lg:block">
-          Resets in <span className="text-cyber-cyan font-mono">{gmtTimeUntilReset()}</span> GMT
-        </div>
+      {/* Centre: Counter */}
+      <div className="flex flex-col items-center">
+        <span className="font-mono text-2xl font-bold text-cyber-green text-glow-green count-flip">
+          {formatCount(dailyCount)}
+        </span>
+        <span className="font-mono text-xs text-cyber-green/50 uppercase tracking-wider">
+          attacks today (UTC)
+        </span>
+        {yesterdayCount != null && (
+          <span className="font-mono text-xs text-cyber-green/35">
+            Yesterday: {formatCount(yesterdayCount)}
+          </span>
+        )}
       </div>
 
-      {/* View Toggles */}
-      <div className="flex items-center gap-1">
+      {/* Right: Status + Demo toggle */}
+      <div className="flex items-center gap-4">
         <button
-          onClick={() => setGlobeView(globeView === 'globe' ? 'flat' : 'globe')}
-          className={`btn-cyber flex items-center gap-1.5 ${ globeView === 'globe' ? 'btn-cyber-active' : '' }`}
-          title="Toggle Globe/Map view"
+          onClick={() => setDemoMode(!demoMode)}
+          className={`font-mono text-xs px-2 py-1 rounded border transition-all ${
+            demoMode
+              ? 'border-cyber-purple/60 text-cyber-purple bg-cyber-purple/10'
+              : 'border-cyber-green/20 text-cyber-green/40 hover:border-cyber-green/40'
+          }`}
         >
-          {globeView === 'globe' ? <Globe size={12} /> : <Map size={12} />}
-          <span className="hidden sm:inline">{globeView === 'globe' ? 'Globe' : 'Map'}</span>
+          {demoMode ? '● DEMO' : 'DEMO'}
         </button>
 
-        <button
-          onClick={() => setColorMode(colorMode === 'color' ? 'mono' : 'color')}
-          className={`btn-cyber flex items-center gap-1.5 ${ colorMode === 'mono' ? 'btn-cyber-active' : '' }`}
-          title="Toggle Color/Monochrome"
-        >
-          {colorMode === 'color' ? <Eye size={12} /> : <EyeOff size={12} />}
-          <span className="hidden sm:inline">Mono</span>
-        </button>
-
-        <button
-          onClick={toggleHeatmap}
-          className={`btn-cyber flex items-center gap-1.5 ${ heatmapActive ? 'btn-cyber-active' : '' }`}
-          title="Toggle heat map"
-        >
-          <Layers size={12} />
-          <span className="hidden sm:inline">Heatmap</span>
-        </button>
-
-        <button
-          onClick={toggleDemoMode}
-          className={`btn-cyber flex items-center gap-1.5 ${ demoMode ? 'text-yellow-400 border-yellow-400/40 bg-yellow-400/10' : '' }`}
-          title="Toggle Demo Mode"
-        >
-          {demoMode ? <Square size={12} /> : <Play size={12} />}
-          <span className="hidden sm:inline">Demo</span>
-        </button>
-
-        <div className="w-px h-5 bg-white/10 mx-1" />
-
-        <button
-          onClick={toggleLeftPanel}
-          className="btn-cyber" title="Toggle Country Rankings"
-        >
-          <ChevronLeft size={12} className={leftPanelOpen ? '' : 'rotate-180'} />
-        </button>
-
-        <button
-          onClick={toggleStatsPanel}
-          className={`btn-cyber flex items-center gap-1.5 ${ statsPanelOpen ? 'btn-cyber-active' : '' }`}
-          title="Toggle Stats Panel"
-        >
-          <BarChart2 size={12} />
-          <span className="hidden sm:inline">Stats</span>
-        </button>
-
-        <button
-          onClick={toggleRightPanel}
-          className="btn-cyber" title="Toggle Attack Feed"
-        >
-          <ChevronRight size={12} className={rightPanelOpen ? '' : 'rotate-180'} />
-        </button>
-
-        {/* Connection status */}
-        <div className={`flex items-center gap-1.5 ml-2 text-xs font-mono font-bold ${statusColor}`}>
-          {wsStatus === 'connected' ? <Wifi size={12} /> : <WifiOff size={12} />}
-          {statusLabel}
+        <div className="flex items-center gap-1.5">
+          <span className={`w-1.5 h-1.5 rounded-full ${st.dot} animate-pulse`} />
+          <StatusIcon className={`w-3.5 h-3.5 ${st.color}`} />
+          <span className={`font-mono text-xs ${st.color} hidden sm:block`}>{st.label}</span>
         </div>
       </div>
     </header>

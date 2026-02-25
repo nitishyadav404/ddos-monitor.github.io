@@ -1,57 +1,78 @@
 import React from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
 import useStore from '../../store/useStore.js'
-import { formatNumber, timeAgo } from '../../utils/formatters.js'
-import { SEVERITY_LEVELS } from '../../utils/constants.js'
+import { ATTACK_TYPE_COLORS, SEVERITY_COLORS } from '../../utils/constants.js'
+import { shortTime, formatBps } from '../../utils/formatters.js'
 
 export default function ArcTooltip() {
-  const hoveredArc = useStore((s) => s.hoveredArc)
+  const { hoveredArc } = useStore()
+
   if (!hoveredArc) return null
 
-  const sev = SEVERITY_LEVELS[hoveredArc.severity] || SEVERITY_LEVELS.medium
+  const typeColor = ATTACK_TYPE_COLORS[hoveredArc.type] || '#00ff88'
+  const sevColor  = SEVERITY_COLORS[hoveredArc.severity] ||
+    SEVERITY_COLORS[hoveredArc.severity?.charAt(0).toUpperCase() + hoveredArc.severity?.slice(1)] ||
+    '#00ff88'
+
+  // Position near cursor but avoid screen edges
+  const x = Math.min(hoveredArc.x + 12, window.innerWidth  - 220)
+  const y = Math.min(hoveredArc.y + 12, window.innerHeight - 140)
 
   return (
-    <div
-      className="fixed z-50 pointer-events-none animate-fade-in"
-      style={{ left: (hoveredArc.x || 0) + 16, top: (hoveredArc.y || 0) - 10 }}
-    >
-      <div className="panel-glass p-3 min-w-48 max-w-64 text-xs shadow-2xl">
-        <div className="flex items-center gap-2 mb-2">
-          <span className="text-sm">{hoveredArc.typeColor ? '⚡' : ''}</span>
-          <span className="font-bold text-white">{hoveredArc.typeName}</span>
+    <AnimatePresence>
+      <motion.div
+        key="arc-tooltip"
+        initial={{ opacity: 0, scale: 0.92 }}
+        animate={{ opacity: 1, scale: 1 }}
+        exit={{ opacity: 0, scale: 0.92 }}
+        transition={{ duration: 0.12 }}
+        className="fixed z-50 pointer-events-none panel-card rounded-lg px-3 py-2.5"
+        style={{ left: x, top: y, minWidth: 190 }}
+      >
+        {/* Route */}
+        <div className="font-mono text-xs font-semibold text-cyber-green mb-1.5">
+          {hoveredArc.source_country || '??'} → {hoveredArc.target_country || '??'}
+        </div>
+
+        {/* Type */}
+        <div className="flex items-center gap-1.5 mb-1">
           <span
-            className="ml-auto attack-badge text-[10px]"
-            style={{ color: sev.color, background: sev.bg, borderColor: sev.border }}
+            className="font-mono text-xs px-1.5 py-0.5 rounded"
+            style={{ color: typeColor, background: typeColor + '18', border: `1px solid ${typeColor}40` }}
           >
-            {hoveredArc.severityLabel}
+            {hoveredArc.type}
           </span>
         </div>
-        <div className="space-y-1 text-gray-300">
-          <div className="flex justify-between">
-            <span className="text-gray-500">Source</span>
-            <span>{hoveredArc.sourceFlag} {hoveredArc.sourceName}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-gray-500">Target</span>
-            <span>{hoveredArc.targetFlag} {hoveredArc.targetName}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-gray-500">Volume</span>
-            <span className="font-mono">{formatNumber(hoveredArc.volume || 0)} pps</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-gray-500">Confidence</span>
-            <span className="font-mono">{hoveredArc.confidence || 0}%</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-gray-500">Detected</span>
-            <span>{timeAgo(hoveredArc.timestamp)}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-gray-500">ID</span>
-            <span className="font-mono text-[9px] text-gray-600">{hoveredArc.id?.slice(0, 16)}…</span>
-          </div>
+
+        {/* Severity */}
+        <div className="flex items-center gap-1.5 mb-1">
+          <span className="font-mono text-xs text-cyber-green/40">Severity:</span>
+          <span className="font-mono text-xs font-semibold" style={{ color: sevColor }}>
+            {(hoveredArc.severity || 'low').toUpperCase()}
+          </span>
         </div>
-      </div>
-    </div>
+
+        {/* Confidence */}
+        {hoveredArc.confidence > 0 && (
+          <div className="flex items-center gap-1.5 mb-1">
+            <span className="font-mono text-xs text-cyber-green/40">Confidence:</span>
+            <span className="font-mono text-xs text-cyber-green">{Math.round(hoveredArc.confidence)}%</span>
+          </div>
+        )}
+
+        {/* Volume */}
+        {hoveredArc.volume_bps && (
+          <div className="flex items-center gap-1.5 mb-1">
+            <span className="font-mono text-xs text-cyber-green/40">Volume:</span>
+            <span className="font-mono text-xs text-cyber-orange">{formatBps(hoveredArc.volume_bps)}</span>
+          </div>
+        )}
+
+        {/* Time */}
+        <div className="font-mono text-xs text-cyber-green/25 mt-1">
+          {shortTime(hoveredArc.timestamp)}
+        </div>
+      </motion.div>
+    </AnimatePresence>
   )
 }
