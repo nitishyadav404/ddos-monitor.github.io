@@ -13,6 +13,7 @@ permissions:
   pages:    write
   id-token: write
 
+# locked and loaded
 # Only one deployment runs at a time; cancel in-progress if a new push arrives
 concurrency:
   group: pages
