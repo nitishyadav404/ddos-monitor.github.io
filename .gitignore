@@ -1,10 +1,59 @@
-# Environment variables
+# ─── Environment / Secrets ───────────────────────────────────────────────────
 .env
+*.env
+.env.*
+!.env.example
 
-# Python
+# ─── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-log.txt
+pip-delete-this-directory.txt
+.venv/
+venv/
+env/
+ENV/
 
-# OS
+# ─── ML Model files (never commit trained models) ────────────────────────────
+backend/models/*.pkl
+backend/models/*.joblib
+backend/models/*.h5
+backend/models/*.bin
+# Keep the folder itself
+!backend/models/.gitkeep
+
+# ─── MaxMind GeoIP DB (large binary, download separately) ────────────────────
+*.mmdb
+
+# ─── Node / Frontend ─────────────────────────────────────────────────────────
+node_modules/
+dist/
+.cache/
+.parcel-cache/
+.vite/
+
+# ─── OS ──────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+*.log
+logs/

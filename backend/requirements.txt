@@ -1,2 +1,29 @@
+# ── Web framework ────────────────────────────────────────────
 fastapi
-uvicorn
+uvicorn[standard]
+
+# ── Config / env management ──────────────────────────────────
+pydantic-settings
+python-dotenv
+
+# ── HTTP client (for AbuseIPDB + Cloudflare API calls) ───────
+httpx
+
+# ── Database (added in Step 2) ───────────────────────────────
+# SQLAlchemy[asyncio]
+# asyncpg
+
+# ── Redis (added in Step 2) ──────────────────────────────────
+# redis[asyncio]
+
+# ── GeoIP (added in Step 4) ──────────────────────────────────
+# geoip2
+
+# ── ML (added in Step 5) ─────────────────────────────────────
+# scikit-learn
+# joblib
+# pandas
+# numpy
+
+# ── Scheduler / cron jobs (added in Step 3) ──────────────────
+# apscheduler
