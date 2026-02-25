@@ -34,34 +34,6 @@
 | ML | scikit-learn (Random Forest) |
 | GeoIP | MaxMind GeoLite2 |
 
-## 🚀 Quick Start
-
-### Frontend
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-### Backend
-```bash
-cd backend
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
-```
-
-### Environment Variables
-
-Copy `.env.example` to `.env` in both `frontend/` and `backend/` and fill in your API keys:
-
-```env
-# backend/.env
-ABUSEIPDB_API_KEY=your_key_here
-CLOUDFLARE_API_TOKEN=your_token_here
-DATABASE_URL=postgresql://user:pass@localhost/ddos_monitor
-REDIS_URL=redis://localhost:6379
-```
-
 ## 📁 Project Structure
 
 ```
