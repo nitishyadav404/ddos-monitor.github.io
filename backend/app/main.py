@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -11,39 +12,54 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
-# ── Startup / Shutdown ────────────────────────────────────────────────────────────
+# ── Startup / Shutdown lifespan ──────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── STARTUP ──
-    logger.info("Starting DDoS Monitor API (env=%s)", settings.ENV)
+    logger.info("Starting DDoS Monitor API | env=%s demo=%s", settings.ENV, settings.DEMO_MODE)
 
-    # Create all DB tables if they don’t exist (idempotent)
+    # 1. Create DB tables (idempotent — safe to run every restart)
     if settings.DATABASE_URL:
         try:
-            from .database import get_engine, Base
-            import app.models  # noqa — ensures all models are registered
+            from .database import Base, get_engine
+            import app.models  # noqa — registers all ORM models with metadata
             async with get_engine().begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
-            logger.info("Database tables verified/created")
+            logger.info("DB: tables verified/created")
         except Exception as e:
-            logger.error("DB startup error (continuing): %s", e)
+            logger.error("DB startup error (continuing without DB): %s", e)
     else:
-        logger.warning("DATABASE_URL not set — running without database")
+        logger.warning("DATABASE_URL not set — skipping DB init")
 
-    # Start the scheduler (ingestion cron jobs)
-    if settings.DATABASE_URL or settings.REDIS_URL:
+    # 2. Start Redis pub/sub listener (broadcasts attacks to WebSocket clients)
+    pubsub_task = None
+    if settings.REDIS_URL:
+        from .ws_manager import redis_pubsub_listener
+        pubsub_task = asyncio.create_task(redis_pubsub_listener())
+        logger.info("Redis pub/sub listener task started")
+    else:
+        logger.warning("REDIS_URL not set — WebSocket broadcast disabled")
+
+    # 3. Start ingestion scheduler (cron jobs every 90s)
+    if settings.REDIS_URL:
         try:
             from .ingestion.scheduler import start_scheduler
             start_scheduler()
         except Exception as e:
             logger.error("Scheduler startup error (continuing): %s", e)
     else:
-        logger.warning("No DB or Redis — scheduler not started")
+        logger.warning("REDIS_URL not set — scheduler not started")
 
     yield
 
     # ── SHUTDOWN ──
     logger.info("Shutting down DDoS Monitor API")
+    if pubsub_task:
+        pubsub_task.cancel()
+        try:
+            await pubsub_task
+        except asyncio.CancelledError:
+            pass
     try:
         from .ingestion.scheduler import stop_scheduler
         stop_scheduler()
@@ -60,7 +76,7 @@ async def lifespan(app: FastAPI):
 # ── App ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="DDoS Monitor API",
-    version="0.1.0",
+    version="0.4.0",
     lifespan=lifespan,
     docs_url="/docs" if settings.ENV == "dev" else None,
     redoc_url="/redoc" if settings.ENV == "dev" else None,
@@ -76,9 +92,7 @@ app.add_middleware(
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PUBLIC REST ENDPOINTS
-# ─────────────────────────────────────────────────────────────────────────────
+# ── PUBLIC REST ENDPOINTS ───────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 async def api_health():
@@ -103,33 +117,27 @@ async def api_health():
 async def attacks_today():
     today_count = 0
     yesterday_count = None
+    percent_change = None
 
     if settings.REDIS_URL:
         try:
             from .redis_client import get_today_counter, get_yesterday_counter
             today_count = await get_today_counter()
             yesterday_count = await get_yesterday_counter()
+            if yesterday_count and yesterday_count > 0:
+                percent_change = round(
+                    ((today_count - yesterday_count) / yesterday_count) * 100, 1
+                )
         except Exception as e:
-            logger.warning("Redis unavailable for today counter: %s", e)
-
-    percent_change = None
-    if yesterday_count and yesterday_count > 0:
-        percent_change = round(
-            ((today_count - yesterday_count) / yesterday_count) * 100, 1
-        )
+            logger.warning("Redis unavailable for counter: %s", e)
 
     return {
         "utc_day": "today",
         "total": today_count,
         "by_type": {
-            "SYN Flood": 0,
-            "UDP Flood": 0,
-            "HTTP Flood": 0,
-            "DNS Amplification": 0,
-            "NTP Amplification": 0,
-            "ICMP Flood": 0,
-            "Volumetric": 0,
-            "Botnet-Driven": 0,
+            "SYN Flood": 0, "UDP Flood": 0, "HTTP Flood": 0,
+            "DNS Amplification": 0, "NTP Amplification": 0,
+            "ICMP Flood": 0, "Volumetric": 0, "Botnet-Driven": 0,
         },
         "previous_day_total": yesterday_count,
         "percent_change": percent_change,
@@ -154,9 +162,10 @@ def stats_attack_types():
 
 @app.get("/api/country/{code}")
 def country_detail(code: str):
+    from .geoip import get_country_name
     return {
         "country_code": code.upper(),
-        "country_name": None,
+        "country_name": get_country_name(code),
         "incoming_today": 0,
         "outgoing_today": 0,
         "top_attack_types": [],
@@ -167,9 +176,7 @@ def country_detail(code: str):
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# INTERNAL ENDPOINTS — protected, not shown in public docs
-# ─────────────────────────────────────────────────────────────────────────────
+# ── INTERNAL ENDPOINTS ───────────────────────────────────────────────────────────────
 
 @app.post("/api/ingest", dependencies=[Depends(require_internal_key)])
 def ingest_event():
@@ -181,41 +188,44 @@ def predict_event():
     return {"ok": False, "reason": "Not implemented yet — Step 5"}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# WEBSOCKET — live attack stream
-# ws://localhost:8000/ws/attacks  (matches VITE_WS_URL)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── WEBSOCKET ────────────────────────────────────────────────────────────────────────────
 
 @app.websocket("/ws/attacks")
 async def ws_attacks(websocket: WebSocket):
+    from .ws_manager import manager
+    from .redis_client import get_recent_attacks
+
     await websocket.accept()
+    manager.register(websocket)
+
     try:
-        # Send hello frame with current state
+        # 1. Hello frame
         await websocket.send_json({
             "type": "connected",
             "message": "DDoS Monitor WebSocket ready",
             "demo_mode": settings.DEMO_MODE,
         })
 
-        # Send recent attacks immediately for fast page load
+        # 2. Send last 100 attacks immediately (fast page load)
         if settings.REDIS_URL:
             try:
-                from .redis_client import get_recent_attacks
                 recent = await get_recent_attacks(100)
                 if recent:
                     await websocket.send_json({
                         "type": "initial_batch",
                         "attacks": recent,
+                        "count": len(recent),
                     })
             except Exception as e:
                 logger.warning("Could not load recent attacks from Redis: %s", e)
 
-        # Keep-alive: echo pings, await Redis pub/sub in Step 6
+        # 3. Keep connection alive — new attacks arrive via Redis pub/sub listener
         while True:
-            data = await websocket.receive_text()
-            await websocket.send_json({"type": "pong"})
+            await websocket.receive_text()  # waits for ping or close frame
 
     except WebSocketDisconnect:
-        return
+        pass
     except Exception as e:
         logger.error("WebSocket error: %s", e)
+    finally:
+        manager.unregister(websocket)
