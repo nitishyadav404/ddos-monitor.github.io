@@ -1,0 +1,70 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background-color: #0a0e27;
+    color: #ffffff;
+    font-family: 'Inter', system-ui, sans-serif;
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+  }
+  #root {
+    height: 100vh;
+    width: 100vw;
+    overflow: hidden;
+  }
+}
+
+@layer components {
+  .panel-glass {
+    @apply bg-space-600/80 backdrop-blur-sm border border-white/10 rounded-xl;
+  }
+  .btn-cyber {
+    @apply px-3 py-1.5 rounded-lg text-xs font-medium transition-all duration-200
+           border border-white/10 bg-space-500/60 hover:bg-space-400/80
+           hover:border-cyber-cyan/40 text-gray-300 hover:text-white;
+  }
+  .btn-cyber-active {
+    @apply border-cyber-cyan/60 bg-cyber-cyan/10 text-cyber-cyan;
+  }
+  .severity-critical { @apply text-red-400 bg-red-500/20 border-red-500/30; }
+  .severity-high     { @apply text-orange-400 bg-orange-500/20 border-orange-500/30; }
+  .severity-medium   { @apply text-yellow-400 bg-yellow-500/20 border-yellow-500/30; }
+  .severity-low      { @apply text-green-400 bg-green-500/20 border-green-500/30; }
+  .attack-badge {
+    @apply text-xs px-2 py-0.5 rounded-full font-mono font-medium border;
+  }
+  .scrollbar-cyber::-webkit-scrollbar { width: 4px; }
+  .scrollbar-cyber::-webkit-scrollbar-track { background: #0d1234; }
+  .scrollbar-cyber::-webkit-scrollbar-thumb { background: #00d4ff44; border-radius: 2px; }
+  .scrollbar-cyber::-webkit-scrollbar-thumb:hover { background: #00d4ff88; }
+}
+
+@layer utilities {
+  .text-glow-cyan { text-shadow: 0 0 10px #00d4ff, 0 0 20px #00d4ff55; }
+  .text-glow-red  { text-shadow: 0 0 10px #ff3366, 0 0 20px #ff336655; }
+  .border-glow    { box-shadow: 0 0 0 1px #00d4ff22, 0 0 10px #00d4ff11; }
+  .globe-container canvas { border-radius: 0 !important; }
+}
+
+/* Animated counter roll */
+.counter-digit {
+  display: inline-block;
+  transition: transform 0.3s ease-out, opacity 0.3s;
+}
+
+/* Speed knob */
+.knob-ring {
+  transition: stroke-dashoffset 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Attack arc glow */
+.arc-tooltip {
+  pointer-events: none;
+  transition: opacity 0.2s;
+}
