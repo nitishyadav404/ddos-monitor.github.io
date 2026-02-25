@@ -4,22 +4,19 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
 
+  // When built in GitHub Actions, set the correct base path for Pages
+  // Repo: nitishyadav404/ddos-monitor.github.io  →  https://nitishyadav404.github.io/ddos-monitor.github.io/
+  base: process.env.GITHUB_ACTIONS ? '/ddos-monitor.github.io/' : '/',
+
   resolve: {
-    // Ensure one shared copy of three across all packages
     dedupe: ['three'],
   },
 
   server: {
     port: 3000,
     proxy: {
-      '/api': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-      },
-      '/ws': {
-        target: 'ws://localhost:8000',
-        ws: true,
-      },
+      '/api': { target: 'http://localhost:8000', changeOrigin: true },
+      '/ws':  { target: 'ws://localhost:8000',   ws: true },
     },
   },
 
