@@ -148,6 +148,7 @@ function buildStars(scene) {
 //   At globe edge/limb:   dot≈0 → rim≈1 → alpha≈1 (bright glow)
 // ═══════════════════════════════════════════════════════════════════════
 function buildAtmosphere(scene) {
+  // ── 1. Original BackSide rim glow (UNCHANGED) ──────────────────────────
   const atmoMat = new THREE.ShaderMaterial({
     vertexShader: `
       varying vec3 vNormal;
@@ -179,11 +180,117 @@ function buildAtmosphere(scene) {
     new THREE.SphereGeometry(1.18, 64, 64),
     atmoMat
   )
-  // renderOrder 2: renders AFTER globe (renderOrder 1) has written depth.
-  // Fragments behind the globe fail depth test → invisible on globe face.
-  // Only the outer shell beyond the globe silhouette passes → pure rim glow.
   atmoMesh.renderOrder = 2
   scene.add(atmoMesh)
+
+  // ── 2. Kaspersky-style Limb Glow (tight FrontSide rim) ─────────────────
+  const glowMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uColor:     { value: new THREE.Color('#00ff66') },
+      uIntensity: { value: 0.18 },
+    },
+    vertexShader: `
+      varying vec3 vNormal;
+      varying vec3 vViewPos;
+      void main() {
+        vNormal  = normalize(normalMatrix * normal);
+        vec4 mv  = modelViewMatrix * vec4(position, 1.0);
+        vViewPos = mv.xyz;
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: `
+      uniform vec3  uColor;
+      uniform float uIntensity;
+      varying vec3 vNormal;
+      varying vec3 vViewPos;
+      void main() {
+        vec3  viewDir = normalize(-vViewPos);
+        float rim = 1.0 - abs(dot(viewDir, normalize(vNormal)));
+        float g   = pow(rim, 8.0);
+        float a   = clamp(g * uIntensity, 0.0, 0.30);
+        gl_FragColor = vec4(uColor, a);
+      }
+    `,
+    transparent: true,
+    blending:    THREE.AdditiveBlending,
+    depthWrite:  false,
+    depthTest:   true,
+    side:        THREE.FrontSide,
+  })
+  const glowMesh = new THREE.Mesh(new THREE.SphereGeometry(1.04, 96, 96), glowMat)
+  glowMesh.renderOrder = 3
+  scene.add(glowMesh)
+
+  // ── 3. Kaspersky-style Evaporating Mist (2 shells) ─────────────────────
+  const makeMistMat = (seed) => new THREE.ShaderMaterial({
+    uniforms: {
+      uTime:     { value: 0 },
+      uSeed:     { value: seed },
+      uColor:    { value: new THREE.Color('#00ff66') },
+      uAmount:   { value: 0.09 },
+      uSoftness: { value: 1.2 },
+    },
+    vertexShader: `
+      varying vec3 vNormal;
+      varying vec3 vViewPos;
+      varying vec3 vWorld;
+      void main() {
+        vNormal  = normalize(normalMatrix * normal);
+        vec4 mv  = modelViewMatrix * vec4(position, 1.0);
+        vViewPos = mv.xyz;
+        vWorld   = (modelMatrix * vec4(position, 1.0)).xyz;
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: `
+      uniform float uTime;
+      uniform float uSeed;
+      uniform vec3  uColor;
+      uniform float uAmount;
+      uniform float uSoftness;
+      varying vec3 vNormal;
+      varying vec3 vViewPos;
+      varying vec3 vWorld;
+
+      float hash(vec3 p) {
+        p = fract(p * 0.3183099 + uSeed);
+        p *= 17.0;
+        return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+      }
+      float noise(vec3 p) {
+        float n = 0.0, a = 0.55;
+        for (int i = 0; i < 4; i++) { n += a * hash(p); p *= 1.8; a *= 0.55; }
+        return n;
+      }
+
+      void main() {
+        vec3  viewDir = normalize(-vViewPos);
+        float rim  = 1.0 - abs(dot(viewDir, normalize(vNormal)));
+        float base = pow(rim, uSoftness);
+
+        vec3 p = normalize(vWorld) * 3.0;
+        p += vec3(uTime * 0.05, uTime * 0.03, -uTime * 0.04);
+        float n   = noise(p);
+        float fog = smoothstep(0.35, 0.92, n) * base;
+        float a   = clamp(fog * uAmount, 0.0, 0.11);
+        gl_FragColor = vec4(uColor, a);
+      }
+    `,
+    transparent: true,
+    blending:    THREE.AdditiveBlending,
+    depthWrite:  false,
+    depthTest:   true,
+    side:        THREE.FrontSide,
+  })
+
+  const mist1 = new THREE.Mesh(new THREE.SphereGeometry(1.20, 96, 96), makeMistMat(1.3))
+  const mist2 = new THREE.Mesh(new THREE.SphereGeometry(1.32, 96, 96), makeMistMat(7.7))
+  mist1.renderOrder = 3
+  mist2.renderOrder = 3
+  scene.add(mist1, mist2)
+
+  return { mistMats: [mist1.material, mist2.material] }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -218,7 +325,7 @@ async function buildCountryBorders(scene) {
         const pts = ring.map(([lng, lat]) => ll2v(lat, lng, R + .0015))
         if (!pts[0].equals(pts[pts.length - 1])) pts.push(pts[0].clone())
         const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat)
-        line.renderOrder = 3
+        line.renderOrder = 4
         scene.add(line)
       }
       if (f.geometry.type === 'Polygon')      f.geometry.coordinates.forEach(drawRing)
@@ -555,16 +662,16 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
 
     buildStars(scene)          // renderOrder 0
     buildGlobe(scene)          // renderOrder 1 — writes depth first
-    buildAtmosphere(scene)     // renderOrder 2 — depth-tested, rim only visible
+    const fx = buildAtmosphere(scene)  // BackSide glow + LimbGlow + Mist (renderOrder 2,3)
     const labelObjects = buildLabels3D(scene)
     buildCountryBorders(scene) // renderOrder 3
 
     const missilesGrp = new THREE.Group()
     const trailsGrp   = new THREE.Group()
     const spikesGrp   = new THREE.Group()
-    missilesGrp.renderOrder = 4
-    trailsGrp.renderOrder   = 4
-    spikesGrp.renderOrder   = 4
+    missilesGrp.renderOrder = 5
+    trailsGrp.renderOrder   = 5
+    spikesGrp.renderOrder   = 5
     scene.add(missilesGrp, trailsGrp, spikesGrp)
 
     const onResize = () => {
@@ -641,6 +748,10 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
       spikesGrp.children.filter(s => s.userData.done).forEach(s => { s.geometry.dispose(); s.material.dispose(); spikesGrp.remove(s) })
       if (renderedRef.current.size > 600) renderedRef.current.clear()
 
+      // ── Kaspersky mist animation ──
+      const _t = performance.now() * 0.001
+      fx?.mistMats?.forEach(m => { m.uniforms.uTime.value = _t })
+
       renderer.render(scene, camera)
       css2d.render(scene, camera)
     }
@@ -648,7 +759,9 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
 
     refs.current = { scene, missilesGrp, trailsGrp, spikesGrp, controls, renderer, css2d, el }
     return () => {
-      cancelAnimationFrame(rafId); window.removeEventListener('resize', onResize)
+      cancelAnimationFrame(rafId)
+      // Dispose mist/glow FX
+      if (fx?.mistMats) fx.mistMats.forEach(m => m.dispose()); window.removeEventListener('resize', onResize)
       controls.dispose(); renderer.dispose()
       if (el.contains(renderer.domElement)) el.removeChild(renderer.domElement)
       if (el.contains(css2d.domElement))    el.removeChild(css2d.domElement)
