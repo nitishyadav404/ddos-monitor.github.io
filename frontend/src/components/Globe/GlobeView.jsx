@@ -1,16 +1,19 @@
 /**
  * GlobeView.jsx — 3D Globe + 2D Flat Map
  *
- * LAYER ORDER (back → front):
- *   renderOrder 0  → halo sprite   (behind everything, pure background glow)
- *   renderOrder 1  → globe mesh    (solid Earth, occludes halo correctly)
- *   renderOrder 2  → borders       (country lines sit on globe surface)
- *   renderOrder 3  → missiles/arcs (fly above globe surface)
+ * ATMOSPHERE APPROACH (final):
+ *   A THREE.BackSide sphere at radius 1.18 with a custom ShaderMaterial.
+ *   BackSide means it only renders the inside-facing surface as seen from
+ *   outside — i.e. only the rim/limb is visible. The globe FrontSide mesh
+ *   (radius 1.0) writes to the depth buffer and naturally occludes the
+ *   atmosphere sphere on the globe face. Zero sprite sizing math needed.
  *
- * The halo sprite has depthTest:false + depthWrite:false so it never
- * clips through the globe; renderOrder guarantees it paints first,
- * then the opaque globe paints on top and naturally covers the centre.
- * Only the ring outside the globe silhouette is visible. ✓
+ * LAYER ORDER (back → front):
+ *   Stars          — renderOrder 0
+ *   Atmosphere     — renderOrder 1  (BackSide sphere, depth-tested)
+ *   Globe mesh     — renderOrder 2  (FrontSide, writes depth)
+ *   Country lines  — renderOrder 3
+ *   Missiles/arcs  — renderOrder 4
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
@@ -122,8 +125,69 @@ function buildStars(scene) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// GLOBE — renderOrder 1 (front overlay over the halo)
-// depthWrite: true so it writes to depth buffer and occludes the halo
+// ATMOSPHERE — BackSide sphere, radius 1.18
+//
+// KEY INSIGHT: THREE.BackSide renders the inward-facing normals.
+// From outside the sphere you see only the limb/rim because:
+//   • The globe mesh (FrontSide, r=1.0) writes to the depth buffer first
+//     (renderOrder 2 > renderOrder 1, drawn second but depth wins via
+//     standard depth test since atmo is drawn first into depth buffer
+//     and then globe overwrites it).
+//   Wait — correct order: we want globe depth written BEFORE atmo test.
+//   So: renderOrder 1 = atmosphere, renderOrder 2 = globe.
+//   Three.js renders lower renderOrder FIRST. Globe (2) renders AFTER.
+//   But depth test on atmo (1) runs BEFORE globe writes depth → atmo wins.
+//
+//   CORRECT ORDER for depth occlusion:
+//   Globe renderOrder LOWER than atmosphere so globe depth is written first:
+//     Globe       → renderOrder 1  (writes depth)
+//     Atmosphere  → renderOrder 2  (depth-tested against globe, rim only passes)
+//
+// The Fresnel rim formula: rim = 1 - |dot(viewDir, normal)|
+//   At globe centre face: dot≈1 → rim≈0 → alpha≈0 (transparent)
+//   At globe edge/limb:   dot≈0 → rim≈1 → alpha≈1 (bright glow)
+// ═══════════════════════════════════════════════════════════════════════
+function buildAtmosphere(scene) {
+  const atmoMat = new THREE.ShaderMaterial({
+    vertexShader: `
+      varying vec3 vNormal;
+      varying vec3 vPosition;
+      void main() {
+        vNormal   = normalize(normalMatrix * normal);
+        vPosition = (modelViewMatrix * vec4(position, 1.0)).xyz;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      varying vec3 vNormal;
+      varying vec3 vPosition;
+      void main() {
+        vec3  viewDir = normalize(-vPosition);
+        float rim     = 1.0 - abs(dot(viewDir, vNormal));
+        float glow    = pow(rim, 2.8);
+        vec3  color   = mix(vec3(0.0, 0.55, 0.22), vec3(0.0, 1.0, 0.45), glow);
+        float alpha   = clamp(glow * 1.15, 0.0, 0.90);
+        gl_FragColor  = vec4(color, alpha);
+      }
+    `,
+    side:        THREE.BackSide,
+    blending:    THREE.AdditiveBlending,
+    transparent: true,
+    depthWrite:  false,
+  })
+  const atmoMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(1.18, 64, 64),
+    atmoMat
+  )
+  // renderOrder 2: renders AFTER globe (renderOrder 1) has written depth.
+  // Fragments behind the globe fail depth test → invisible on globe face.
+  // Only the outer shell beyond the globe silhouette passes → pure rim glow.
+  atmoMesh.renderOrder = 2
+  scene.add(atmoMesh)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// GLOBE — renderOrder 1 (renders first, writes depth buffer)
 // ═══════════════════════════════════════════════════════════════════════
 function buildGlobe(scene) {
   const L    = new THREE.TextureLoader()
@@ -134,10 +198,9 @@ function buildGlobe(scene) {
       specularMap: L.load('https://unpkg.com/three-globe@2.27.3/example/img/earth-water.png'),
       bumpMap:     L.load('https://unpkg.com/three-globe@2.27.3/example/img/earth-topology.png'),
       bumpScale: .01, specular: new THREE.Color(0x1a3344), shininess: 6,
-      // depthWrite defaults to true — globe writes depth so halo is hidden behind it
     })
   )
-  mesh.renderOrder = 1   // paints AFTER halo (renderOrder 0), covers it cleanly
+  mesh.renderOrder = 1   // renders first → depth buffer filled → occludes atmosphere
   scene.add(mesh)
 }
 
@@ -155,97 +218,13 @@ async function buildCountryBorders(scene) {
         const pts = ring.map(([lng, lat]) => ll2v(lat, lng, R + .0015))
         if (!pts[0].equals(pts[pts.length - 1])) pts.push(pts[0].clone())
         const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat)
-        line.renderOrder = 2   // on top of globe surface
+        line.renderOrder = 3
         scene.add(line)
       }
       if (f.geometry.type === 'Polygon')      f.geometry.coordinates.forEach(drawRing)
       else if (f.geometry.type === 'MultiPolygon') f.geometry.coordinates.forEach(p => p.forEach(drawRing))
     })
   } catch(e) { console.warn('3D borders:', e) }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// ATMOSPHERE HALO — renderOrder 0 (BEHIND the globe)
-//
-// Rendered first (lowest renderOrder). The opaque globe (renderOrder 1)
-// paints over the centre of the sprite so only the ring that pokes
-// outside the globe silhouette is visible — exactly like Kaspersky.
-//
-// Texture: 512×512 canvas ring
-//   innerR = globe circumference in texture space (0.385 × SIZE)
-//   outerR = how far the glow extends into space   (0.500 × SIZE)
-//   Centre punched transparent so globe face is clean.
-// ═══════════════════════════════════════════════════════════════════════
-function makeHaloTexture() {
-  const SIZE = 512
-  const c    = document.createElement('canvas')
-  c.width = c.height = SIZE
-  const ctx = c.getContext('2d')
-  const cx  = SIZE / 2
-
-  // innerR maps to R=1.0 in world space; outerR is how far into space it bleeds
-  const innerR = SIZE * 0.385
-  const outerR = SIZE * 0.500
-
-  // 1. Radial glow outward from globe edge into space
-  const grad = ctx.createRadialGradient(cx, cx, innerR, cx, cx, outerR)
-  grad.addColorStop(0.00, 'rgba(0,255,100, 0.95)')
-  grad.addColorStop(0.15, 'rgba(0,230,80,  0.70)')
-  grad.addColorStop(0.35, 'rgba(0,200,60,  0.40)')
-  grad.addColorStop(0.55, 'rgba(0,160,40,  0.18)')
-  grad.addColorStop(0.75, 'rgba(0,120,30,  0.06)')
-  grad.addColorStop(0.90, 'rgba(0, 80,20,  0.02)')
-  grad.addColorStop(1.00, 'rgba(0,  0, 0,  0.00)')
-  ctx.fillStyle = grad
-  ctx.fillRect(0, 0, SIZE, SIZE)
-
-  // 2. Punch out centre — globe body area is fully transparent in the texture
-  ctx.globalCompositeOperation = 'destination-out'
-  ctx.beginPath()
-  ctx.arc(cx, cx, innerR - 1, 0, Math.PI * 2)
-  ctx.fillStyle = 'rgba(0,0,0,1)'
-  ctx.fill()
-  ctx.globalCompositeOperation = 'source-over'
-
-  // 3. Crisp bright ring right at the globe edge
-  const ringGrad = ctx.createRadialGradient(cx, cx, innerR - 3, cx, cx, innerR + 8)
-  ringGrad.addColorStop(0,   'rgba(80,255,140, 0.0)')
-  ringGrad.addColorStop(0.3, 'rgba(80,255,140, 0.9)')
-  ringGrad.addColorStop(0.6, 'rgba(40,220,100, 0.6)')
-  ringGrad.addColorStop(1,   'rgba(0, 180, 60, 0.0)')
-  ctx.fillStyle = ringGrad
-  ctx.beginPath()
-  ctx.arc(cx, cx, innerR + 8, 0, Math.PI * 2)
-  ctx.fill()
-  // punch again to keep globe area clean
-  ctx.globalCompositeOperation = 'destination-out'
-  ctx.beginPath()
-  ctx.arc(cx, cx, innerR - 3, 0, Math.PI * 2)
-  ctx.fillStyle = 'rgba(0,0,0,1)'
-  ctx.fill()
-  ctx.globalCompositeOperation = 'source-over'
-
-  return new THREE.CanvasTexture(c)
-}
-
-function buildAtmosphere(scene) {
-  const tex = makeHaloTexture()
-  const mat = new THREE.SpriteMaterial({
-    map:         tex,
-    blending:    THREE.AdditiveBlending,
-    transparent: true,
-    depthWrite:  false,   // halo never writes depth — globe always wins
-    depthTest:   false,   // don't depth-clip; renderOrder handles draw order
-    opacity:     1.0,
-  })
-  const sprite = new THREE.Sprite(mat)
-  // Scale: innerR/SIZE = 0.385 maps to R=1.0
-  // sprite diameter in world units = SIZE/innerR * R * 2 = 2.597 ≈ 2.6
-  const s = (1.0 / 0.385) * 0.5 * 2
-  sprite.scale.set(s, s, 1)
-  sprite.renderOrder = 0   // ← BEHIND — drawn first, globe (renderOrder 1) paints over it
-  scene.add(sprite)
-  return { mat, tex, sprite }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -546,9 +525,7 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     const camera = new THREE.PerspectiveCamera(45, W/H, .1, 100)
     camera.position.z = 2.5
 
-    // sortObjects: true (default) respects renderOrder — critical for halo layering
     const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true })
-    renderer.sortObjects = true
     renderer.setSize(W, H)
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     el.appendChild(renderer.domElement)
@@ -576,19 +553,18 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     const sun = new THREE.DirectionalLight(0x88aacc, .45)
     sun.position.set(4, 2, 4); scene.add(sun)
 
-    buildStars(scene)
-    buildAtmosphere(scene)     // renderOrder 0 — BEHIND (background layer)
-    buildGlobe(scene)          // renderOrder 1 — FRONT (covers halo centre)
+    buildStars(scene)          // renderOrder 0
+    buildGlobe(scene)          // renderOrder 1 — writes depth first
+    buildAtmosphere(scene)     // renderOrder 2 — depth-tested, rim only visible
     const labelObjects = buildLabels3D(scene)
-    buildCountryBorders(scene) // renderOrder 2 — ON GLOBE surface
+    buildCountryBorders(scene) // renderOrder 3
 
-    // missiles/arcs at renderOrder 3 — ABOVE everything
     const missilesGrp = new THREE.Group()
     const trailsGrp   = new THREE.Group()
     const spikesGrp   = new THREE.Group()
-    missilesGrp.renderOrder = 3
-    trailsGrp.renderOrder   = 3
-    spikesGrp.renderOrder   = 3
+    missilesGrp.renderOrder = 4
+    trailsGrp.renderOrder   = 4
+    spikesGrp.renderOrder   = 4
     scene.add(missilesGrp, trailsGrp, spikesGrp)
 
     const onResize = () => {
