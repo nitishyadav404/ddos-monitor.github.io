@@ -1,11 +1,14 @@
 /**
  * GlobeView.jsx — 3D Globe + 2D Flat Map
  *
+ * NEW: Cyberthreat Atmosphere — two-layer GLSL shader effect:
+ *   Feature 1 — Boiling Mist  (buildMist):   sphere at 1.02R, animated hash-based
+ *               pseudo-noise in fragment shader, BackSide, AdditiveBlending.
+ *   Feature 2 — Evaporating Glow (buildAtmosphere): Fresnel limb-darkening with
+ *               exponential density falloff, strongest at surface edge, 0 in space.
+ *
  * LABEL APPROACH: CSS2DRenderer
- *   - Real HTML <div> labels projected from 3D world positions onto the screen
- *   - Text is always upright, readable, never mirrored or rotated
- *   - Labels hide automatically when their country is on the back hemisphere
- *   - Exactly how Google Maps / Kaspersky CyberMap places country names
+ *   - Real HTML <div> labels always upright, stick to country surface
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
@@ -147,26 +150,198 @@ async function buildCountryBorders(scene) {
   } catch(e) { console.warn('3D borders:', e) }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// FEATURE 2 — Evaporating Glow (Fresnel + Exponential Density Falloff)
+// ═══════════════════════════════════════════════════════════════════════
+// Sphere at 1.015×R, BackSide so it wraps outside the globe.
+// Fresnel: glow is brightest at grazing angles (limb) where the dot-product
+// of the surface normal and view direction approaches 0.
+// Exponential falloff: exp(-k * rimPower) ensures opacity decays to 0 in space.
+// Color: Cyber Green #00ff66
+const GLOW_VERT = /* glsl */`
+  varying vec3 vNormal;
+  varying vec3 vViewDir;
+  void main() {
+    // World-space normal for Fresnel
+    vNormal  = normalize(normalMatrix * normal);
+    // View-space direction from vertex to camera
+    vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+    vViewDir   = normalize(-mvPos.xyz);
+    gl_Position = projectionMatrix * mvPos;
+  }
+`
+
+const GLOW_FRAG = /* glsl */`
+  varying vec3 vNormal;
+  varying vec3 vViewDir;
+
+  // Cyber Green
+  const vec3 CYBER_GREEN = vec3(0.0, 1.0, 0.4);  // #00ff66
+
+  void main() {
+    // Fresnel term: 1 at edge (grazing), 0 at face-on
+    float rim = 1.0 - abs(dot(vNormal, vViewDir));
+    // Sharpen the rim band
+    rim = clamp(rim, 0.0, 1.0);
+    float rimPow = pow(rim, 3.2);
+
+    // Exponential density falloff: most intense near surface edge, 0 in space
+    // k=4.5 gives a tight but visible band
+    float density = exp(-4.5 * (1.0 - rim));
+    float alpha   = rimPow * density * 0.55;
+
+    // Slight colour shift: deeper green at edge, lighter centre
+    vec3 col = mix(vec3(0.0, 0.9, 0.35), CYBER_GREEN, rimPow);
+
+    gl_FragColor = vec4(col, alpha);
+  }
+`
+
 function buildAtmosphere(scene) {
-  scene.add(new THREE.Mesh(
-    new THREE.SphereGeometry(R * 1.012, 64, 64),
+  const mesh = new THREE.Mesh(
+    new THREE.SphereGeometry(R * 1.015, 64, 64),
     new THREE.ShaderMaterial({
-      uniforms: { c: { value: new THREE.Color(0x33dd66) } },
-      vertexShader:   `varying float vI;void main(){vec3 n=normalize(normalMatrix*normal);vec3 v=normalize(-(modelViewMatrix*vec4(position,1.)).xyz);vI=pow(max(0.,1.-dot(n,v)),5.);gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
-      fragmentShader: `uniform vec3 c;varying float vI;void main(){gl_FragColor=vec4(c,vI*.18);}`,
-      side: THREE.FrontSide, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false,
+      vertexShader:   GLOW_VERT,
+      fragmentShader: GLOW_FRAG,
+      side:        THREE.BackSide,
+      blending:    THREE.AdditiveBlending,
+      transparent: true,
+      depthWrite:  false,
     })
-  ))
+  )
+  scene.add(mesh)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// FEATURE 1 — Boiling Mist (Surface Crust with animated noise)
+// ═══════════════════════════════════════════════════════════════════════
+// Sphere at 1.02×R, FrontSide so it shows above the globe surface.
+// Fragment shader uses a fast GPU-hash-based Value Noise (3D) to create
+// drifting, boiling vapor patches that scroll with uTime.
+// Performance notes:
+//   • Low-segment sphere (48×48) — the shader does the detail work
+//   • depthWrite:false avoids expensive depth sorting
+//   • Only 3 octaves of noise (smooth enough, cheap enough)
+const MIST_VERT = /* glsl */`
+  varying vec3 vWorldPos;   // world position passed to frag for 3D noise
+  varying vec3 vNormal;
+  varying vec3 vViewDir;
+  void main() {
+    vec4 worldPos   = modelMatrix * vec4(position, 1.0);
+    vWorldPos       = worldPos.xyz;
+    vNormal         = normalize(normalMatrix * normal);
+    vec4 mvPos      = modelViewMatrix * vec4(position, 1.0);
+    vViewDir        = normalize(-mvPos.xyz);
+    gl_Position     = projectionMatrix * mvPos;
+  }
+`
+
+const MIST_FRAG = /* glsl */`
+  uniform float uTime;
+  varying vec3 vWorldPos;
+  varying vec3 vNormal;
+  varying vec3 vViewDir;
+
+  // ── Fast GPU hash (no texture lookup needed) ──────────────────────
+  // Jarzynski & Olano 2020 — single-pass 3D → float hash
+  float hash31(vec3 p) {
+    p  = fract(p * vec3(127.1, 311.7, 74.7));
+    p += dot(p, p.yzx + 19.19);
+    return fract((p.x + p.y) * p.z);
+  }
+
+  // ── Value Noise: trilinear interpolation of random lattice ────────
+  float vnoise(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    // Smoothstep fade
+    vec3 u = f * f * (3.0 - 2.0 * f);
+    float a = hash31(i);
+    float b = hash31(i + vec3(1,0,0));
+    float c = hash31(i + vec3(0,1,0));
+    float d = hash31(i + vec3(1,1,0));
+    float e = hash31(i + vec3(0,0,1));
+    float g = hash31(i + vec3(1,0,1));
+    float h = hash31(i + vec3(0,1,1));
+    float k = hash31(i + vec3(1,1,1));
+    return mix(
+      mix(mix(a,b,u.x), mix(c,d,u.x), u.y),
+      mix(mix(e,g,u.x), mix(h,k,u.x), u.y),
+      u.z
+    );
+  }
+
+  // ── 3-octave fBm for organic drifting vapour ──────────────────────
+  float fbm(vec3 p) {
+    float v  = 0.0;
+    float amp = 0.5;
+    float freq = 1.0;
+    // 3 octaves — balanced quality vs. GPU cost
+    for (int i = 0; i < 3; i++) {
+      v   += amp * vnoise(p * freq);
+      freq *= 2.1;
+      amp  *= 0.48;
+    }
+    return v;
+  }
+
+  // Cyber Green
+  const vec3 CYBER_GREEN = vec3(0.0, 1.0, 0.4);
+  const vec3 DEEP_GREEN  = vec3(0.0, 0.6, 0.25);
+
+  void main() {
+    // Animate noise by drifting the sample point with time
+    // Using two slightly offset drifts for swirling motion
+    vec3 p1 = vWorldPos * 3.2 + vec3( uTime * 0.07,  uTime * 0.05, -uTime * 0.04);
+    vec3 p2 = vWorldPos * 5.8 + vec3(-uTime * 0.11,  uTime * 0.09,  uTime * 0.06);
+
+    float n1 = fbm(p1);           // large billowing patches
+    float n2 = fbm(p2) * 0.55;   // finer detail wisps
+    float n  = n1 + n2;
+
+    // Threshold: only render patches above noise midpoint (ethereal, not solid)
+    float mist = smoothstep(0.52, 0.95, n);
+
+    // Fresnel masking: mist is thinner where we look straight at the surface
+    float rim = 1.0 - abs(dot(vNormal, vViewDir));
+    float fresnelMask = pow(clamp(rim, 0.0, 1.0), 1.2) * 0.65 + 0.35;
+
+    // Final opacity — translucent, never opaque
+    float alpha = mist * fresnelMask * 0.30;
+
+    // Colour varies between deep and bright green with noise intensity
+    vec3 col = mix(DEEP_GREEN, CYBER_GREEN, mist * 0.8);
+
+    // Discard near-invisible fragments early (perf: avoids blending cost)
+    if (alpha < 0.01) discard;
+
+    gl_FragColor = vec4(col, alpha);
+  }
+`
+
+/**
+ * buildMist — returns the ShaderMaterial so the animate loop can tick uTime.
+ */
+function buildMist(scene) {
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0.0 },
+    },
+    vertexShader:   MIST_VERT,
+    fragmentShader: MIST_FRAG,
+    side:        THREE.FrontSide,
+    blending:    THREE.AdditiveBlending,
+    transparent: true,
+    depthWrite:  false,
+  })
+  // Lower-res sphere — shader provides the visual detail
+  scene.add(new THREE.Mesh(new THREE.SphereGeometry(R * 1.02, 48, 48), mat))
+  return mat
 }
 
 /**
  * buildLabels3D — CSS2DObject approach
- *
- * Font size tiers (+4px from previous version):
- *   Tier 1 (largest countries, mz ≤ 1.0): 15px
- *   Tier 2 (large countries,   mz ≤ 1.5): 13.5px
- *   Tier 3 (medium countries,  mz ≤ 2.5): 12px
- *   Tier 4 (small countries,   mz > 2.5): 11px
+ * Font size tiers: 15 / 13.5 / 12 / 11 px
  */
 function buildLabels3D(scene) {
   const labelObjects = []
@@ -174,9 +349,7 @@ function buildLabels3D(scene) {
   Object.entries(COUNTRIES).forEach(([code, { name, lat, lng }]) => {
     const mz     = MIN_ZOOM[code] ?? 3.5
     const isCity = CITY_KEYS.has(code)
-
-    // Font size tiers — each +4px vs previous version
-    const fs = mz <= 1.0 ? 15 : mz <= 1.5 ? 13.5 : mz <= 2.5 ? 12 : 11
+    const fs     = mz <= 1.0 ? 15 : mz <= 1.5 ? 13.5 : mz <= 2.5 ? 12 : 11
 
     const div = document.createElement('div')
     div.textContent = name
@@ -491,21 +664,17 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     const camera   = new THREE.PerspectiveCamera(45, W/H, .1, 100)
     camera.position.z = 2.5
 
-    // WebGL renderer
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
     renderer.setSize(W, H)
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     el.appendChild(renderer.domElement)
 
-    // CSS2D renderer — sits on top of the WebGL canvas, same size
     const css2d = new CSS2DRenderer()
     css2d.setSize(W, H)
     css2d.domElement.style.cssText = [
-      'position:absolute',
-      'top:0', 'left:0',
+      'position:absolute', 'top:0', 'left:0',
       'width:100%', 'height:100%',
-      'pointer-events:none',
-      'overflow:hidden',
+      'pointer-events:none', 'overflow:hidden',
     ].join(';')
     el.appendChild(css2d.domElement)
 
@@ -520,11 +689,21 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_ROTATE }
 
     scene.add(new THREE.AmbientLight(0x445566, 2.5))
-    const sun = new THREE.DirectionalLight(0x88aacc, .45); sun.position.set(4, 2, 4); scene.add(sun)
+    const sun = new THREE.DirectionalLight(0x88aacc, .45)
+    sun.position.set(4, 2, 4); scene.add(sun)
 
     buildStars(scene)
     buildGlobe(scene)
+
+    // ── Cyberthreat Atmosphere ────────────────────────────────────
+    // Order matters for additive blending:
+    //   1. Boiling Mist  (1.02R, FrontSide) — surface crust noise
+    //   2. Evaporating Glow (1.015R, BackSide) — Fresnel limb glow
+    // Glow is rendered second so it composites correctly on top.
+    const mistMat = buildMist(scene)       // returns mat to tick uTime
     buildAtmosphere(scene)
+    // ─────────────────────────────────────────────────────────────
+
     const labelObjects = buildLabels3D(scene)
     buildCountryBorders(scene)
 
@@ -534,20 +713,23 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     const onResize = () => {
       const nW = el.clientWidth, nH = el.clientHeight
       camera.aspect = nW / nH; camera.updateProjectionMatrix()
-      renderer.setSize(nW, nH)
-      css2d.setSize(nW, nH)
+      renderer.setSize(nW, nH); css2d.setSize(nW, nH)
     }
     window.addEventListener('resize', onResize)
+
+    const clock = new THREE.Clock()  // for uTime
 
     let rafId
     const animate = () => {
       rafId = requestAnimationFrame(animate)
       controls.update()
 
+      // ── Tick mist shader time ──────────────────────────────────
+      mistMat.uniforms.uTime.value = clock.getElapsedTime()
+
       const camDist = camera.position.length()
       const camNorm = camera.position.clone().normalize()
 
-      // ── Label visibility: hide back-hemisphere + distance gate ────
       labelObjects.forEach(obj => {
         const ud = obj.userData
         if (camDist > ud.maxDist) { obj.visible = false; return }
@@ -555,7 +737,6 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
         obj.visible = surfDir.dot(camNorm) > 0.1
       })
 
-      // ── Missiles ──────────────────────────────────────────────────
       const spd = SPD3D[speedRef.current] ?? SPD3D[1]
       missilesGrp.children.forEach(m => {
         const ud = m.userData
