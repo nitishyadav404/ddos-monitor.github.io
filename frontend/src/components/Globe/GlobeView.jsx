@@ -1,10 +1,16 @@
 /**
  * GlobeView.jsx — 3D Globe + 2D Flat Map
  *
- * Atmosphere: Canvas-texture sprite (billboard) centred on the globe.
- * The texture is a radial ring: inner radius = globe edge (R in screen),
- * outer radius fades to transparent in space. Always faces camera.
- * This is EXACTLY how Kaspersky cybermap does it.
+ * LAYER ORDER (back → front):
+ *   renderOrder 0  → halo sprite   (behind everything, pure background glow)
+ *   renderOrder 1  → globe mesh    (solid Earth, occludes halo correctly)
+ *   renderOrder 2  → borders       (country lines sit on globe surface)
+ *   renderOrder 3  → missiles/arcs (fly above globe surface)
+ *
+ * The halo sprite has depthTest:false + depthWrite:false so it never
+ * clips through the globe; renderOrder guarantees it paints first,
+ * then the opaque globe paints on top and naturally covers the centre.
+ * Only the ring outside the globe silhouette is visible. ✓
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
@@ -106,37 +112,51 @@ function buildStars(scene) {
   const g = new THREE.BufferGeometry()
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3))
   g.setAttribute('aSize',    new THREE.Float32BufferAttribute(sz,  1))
-  scene.add(new THREE.Points(g, new THREE.ShaderMaterial({
+  const pts = new THREE.Points(g, new THREE.ShaderMaterial({
     vertexShader:   `attribute float aSize;void main(){vec4 mv=modelViewMatrix*vec4(position,1.);gl_PointSize=aSize*(280./-mv.z);gl_Position=projectionMatrix*mv;}`,
     fragmentShader: `void main(){float d=length(gl_PointCoord-.5)*2.;if(d>1.)discard;gl_FragColor=vec4(1.,1.,1.,(1.-smoothstep(0.,1.,d))*.82);}`,
     transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
-  })))
+  }))
+  pts.renderOrder = 0
+  scene.add(pts)
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// GLOBE — renderOrder 1 (front overlay over the halo)
+// depthWrite: true so it writes to depth buffer and occludes the halo
+// ═══════════════════════════════════════════════════════════════════════
 function buildGlobe(scene) {
-  const L = new THREE.TextureLoader()
-  scene.add(new THREE.Mesh(
+  const L    = new THREE.TextureLoader()
+  const mesh = new THREE.Mesh(
     new THREE.SphereGeometry(R, 64, 64),
     new THREE.MeshPhongMaterial({
       map:         L.load('https://unpkg.com/three-globe@2.27.3/example/img/earth-dark.jpg'),
       specularMap: L.load('https://unpkg.com/three-globe@2.27.3/example/img/earth-water.png'),
       bumpMap:     L.load('https://unpkg.com/three-globe@2.27.3/example/img/earth-topology.png'),
       bumpScale: .01, specular: new THREE.Color(0x1a3344), shininess: 6,
+      // depthWrite defaults to true — globe writes depth so halo is hidden behind it
     })
-  ))
+  )
+  mesh.renderOrder = 1   // paints AFTER halo (renderOrder 0), covers it cleanly
+  scene.add(mesh)
 }
 
 async function buildCountryBorders(scene) {
   try {
     const features = await getTopoFeatures()
-    const mat = new THREE.LineBasicMaterial({ color: 0x3a6045, transparent: true, opacity: .7 })
+    const mat = new THREE.LineBasicMaterial({
+      color: 0x3a6045, transparent: true, opacity: .7,
+      depthTest: true, depthWrite: false,
+    })
     features.forEach(f => {
       if (!f.geometry) return
       const drawRing = ring => {
         if (ring.length < 2) return
         const pts = ring.map(([lng, lat]) => ll2v(lat, lng, R + .0015))
         if (!pts[0].equals(pts[pts.length - 1])) pts.push(pts[0].clone())
-        scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat))
+        const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat)
+        line.renderOrder = 2   // on top of globe surface
+        scene.add(line)
       }
       if (f.geometry.type === 'Polygon')      f.geometry.coordinates.forEach(drawRing)
       else if (f.geometry.type === 'MultiPolygon') f.geometry.coordinates.forEach(p => p.forEach(drawRing))
@@ -145,42 +165,41 @@ async function buildCountryBorders(scene) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// ATMOSPHERE — Canvas sprite billboard (always faces camera)
+// ATMOSPHERE HALO — renderOrder 0 (BEHIND the globe)
 //
-// Strategy: draw a 512×512 canvas ring texture where:
-//   - The INNER edge of the ring sits exactly at globe radius R
-//   - Moving outward (away from Earth into space) the glow fades to 0
-//   - The quad is sized at 2.6R so the outer glow blends into space
+// Rendered first (lowest renderOrder). The opaque globe (renderOrder 1)
+// paints over the centre of the sprite so only the ring that pokes
+// outside the globe silhouette is visible — exactly like Kaspersky.
 //
-// This is camera-facing (SpriteMaterial) so it always looks correct
-// from any viewing angle — the same technique Kaspersky uses.
+// Texture: 512×512 canvas ring
+//   innerR = globe circumference in texture space (0.385 × SIZE)
+//   outerR = how far the glow extends into space   (0.500 × SIZE)
+//   Centre punched transparent so globe face is clean.
 // ═══════════════════════════════════════════════════════════════════════
 function makeHaloTexture() {
   const SIZE = 512
   const c    = document.createElement('canvas')
   c.width = c.height = SIZE
   const ctx = c.getContext('2d')
+  const cx  = SIZE / 2
 
-  const cx = SIZE / 2
-  // Inner radius = globe edge in texture space
-  // Outer radius = how far the glow extends into space
-  const innerR = SIZE * 0.385   // ≈ globe circumference
-  const outerR = SIZE * 0.500   // glow bleeds this far outward into space
+  // innerR maps to R=1.0 in world space; outerR is how far into space it bleeds
+  const innerR = SIZE * 0.385
+  const outerR = SIZE * 0.500
 
-  // ── 1. Base radial glow ring ──────────────────────────────────────
+  // 1. Radial glow outward from globe edge into space
   const grad = ctx.createRadialGradient(cx, cx, innerR, cx, cx, outerR)
-  grad.addColorStop(0.00, 'rgba(0,255,100, 0.95)')  // 100 Lu — at globe edge
-  grad.addColorStop(0.15, 'rgba(0,230,80,  0.70)')  // 80 Lu
-  grad.addColorStop(0.35, 'rgba(0,200,60,  0.40)')  // 60 Lu
-  grad.addColorStop(0.55, 'rgba(0,160,40,  0.18)')  // 40 Lu
-  grad.addColorStop(0.75, 'rgba(0,120,30,  0.06)')  // 20 Lu
-  grad.addColorStop(0.90, 'rgba(0, 80,20,  0.02)')  // 10 Lu
-  grad.addColorStop(1.00, 'rgba(0,  0, 0,  0.00)')  //  0 Lu — gone
+  grad.addColorStop(0.00, 'rgba(0,255,100, 0.95)')
+  grad.addColorStop(0.15, 'rgba(0,230,80,  0.70)')
+  grad.addColorStop(0.35, 'rgba(0,200,60,  0.40)')
+  grad.addColorStop(0.55, 'rgba(0,160,40,  0.18)')
+  grad.addColorStop(0.75, 'rgba(0,120,30,  0.06)')
+  grad.addColorStop(0.90, 'rgba(0, 80,20,  0.02)')
+  grad.addColorStop(1.00, 'rgba(0,  0, 0,  0.00)')
   ctx.fillStyle = grad
   ctx.fillRect(0, 0, SIZE, SIZE)
 
-  // ── 2. Punch out the inner circle (globe itself = black/transparent) 
-  // This removes glow INSIDE the globe so it only shows around the edge
+  // 2. Punch out centre — globe body area is fully transparent in the texture
   ctx.globalCompositeOperation = 'destination-out'
   ctx.beginPath()
   ctx.arc(cx, cx, innerR - 1, 0, Math.PI * 2)
@@ -188,8 +207,7 @@ function makeHaloTexture() {
   ctx.fill()
   ctx.globalCompositeOperation = 'source-over'
 
-  // ── 3. Thin bright ring exactly at the globe circumference ────────
-  // This is the crisp bright line at the exact globe edge (like Kaspersky)
+  // 3. Crisp bright ring right at the globe edge
   const ringGrad = ctx.createRadialGradient(cx, cx, innerR - 3, cx, cx, innerR + 8)
   ringGrad.addColorStop(0,   'rgba(80,255,140, 0.0)')
   ringGrad.addColorStop(0.3, 'rgba(80,255,140, 0.9)')
@@ -199,7 +217,7 @@ function makeHaloTexture() {
   ctx.beginPath()
   ctx.arc(cx, cx, innerR + 8, 0, Math.PI * 2)
   ctx.fill()
-  // punch inner again to keep globe area clean
+  // punch again to keep globe area clean
   ctx.globalCompositeOperation = 'destination-out'
   ctx.beginPath()
   ctx.arc(cx, cx, innerR - 3, 0, Math.PI * 2)
@@ -212,23 +230,20 @@ function makeHaloTexture() {
 
 function buildAtmosphere(scene) {
   const tex = makeHaloTexture()
-  // SpriteMaterial = always faces the camera (billboard)
-  // The sprite quad is sized 2 * halySize world units
-  // innerR/SIZE = 0.385, so 1 globe radius = 0.385 of texture
-  // To map innerR to R=1.0: spriteScale = 1.0 / 0.385 * 0.5 = 1.30
-  // Full sprite = 2 * 1.30 = 2.60 world units wide (covers globe + halo)
   const mat = new THREE.SpriteMaterial({
-    map:        tex,
-    blending:   THREE.AdditiveBlending,
+    map:         tex,
+    blending:    THREE.AdditiveBlending,
     transparent: true,
-    depthWrite:  false,
-    depthTest:   false,
+    depthWrite:  false,   // halo never writes depth — globe always wins
+    depthTest:   false,   // don't depth-clip; renderOrder handles draw order
     opacity:     1.0,
   })
   const sprite = new THREE.Sprite(mat)
-  // Scale so the inner ring of the texture aligns with the globe circumference
-  const s = (1.0 / 0.385) * 0.5 * 2   // = 2.597 ≈ 2.6
+  // Scale: innerR/SIZE = 0.385 maps to R=1.0
+  // sprite diameter in world units = SIZE/innerR * R * 2 = 2.597 ≈ 2.6
+  const s = (1.0 / 0.385) * 0.5 * 2
   sprite.scale.set(s, s, 1)
+  sprite.renderOrder = 0   // ← BEHIND — drawn first, globe (renderOrder 1) paints over it
   scene.add(sprite)
   return { mat, tex, sprite }
 }
@@ -531,7 +546,9 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     const camera = new THREE.PerspectiveCamera(45, W/H, .1, 100)
     camera.position.z = 2.5
 
+    // sortObjects: true (default) respects renderOrder — critical for halo layering
     const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true })
+    renderer.sortObjects = true
     renderer.setSize(W, H)
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     el.appendChild(renderer.domElement)
@@ -560,14 +577,18 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     sun.position.set(4, 2, 4); scene.add(sun)
 
     buildStars(scene)
-    buildGlobe(scene)
-    buildAtmosphere(scene)   // canvas sprite halo
+    buildAtmosphere(scene)     // renderOrder 0 — BEHIND (background layer)
+    buildGlobe(scene)          // renderOrder 1 — FRONT (covers halo centre)
     const labelObjects = buildLabels3D(scene)
-    buildCountryBorders(scene)
+    buildCountryBorders(scene) // renderOrder 2 — ON GLOBE surface
 
+    // missiles/arcs at renderOrder 3 — ABOVE everything
     const missilesGrp = new THREE.Group()
     const trailsGrp   = new THREE.Group()
     const spikesGrp   = new THREE.Group()
+    missilesGrp.renderOrder = 3
+    trailsGrp.renderOrder   = 3
+    spikesGrp.renderOrder   = 3
     scene.add(missilesGrp, trailsGrp, spikesGrp)
 
     const onResize = () => {
@@ -577,7 +598,6 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     }
     window.addEventListener('resize', onResize)
 
-    const clock = new THREE.Clock()
     let rafId
     const animate = () => {
       rafId = requestAnimationFrame(animate)
