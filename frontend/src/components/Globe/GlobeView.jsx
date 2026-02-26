@@ -10,10 +10,18 @@
  *
  * LAYER ORDER (back → front):
  *   Stars          — renderOrder 0
- *   Atmosphere     — renderOrder 1  (BackSide sphere, depth-tested)
- *   Globe mesh     — renderOrder 2  (FrontSide, writes depth)
+ *   Globe mesh     — renderOrder 1  (FrontSide, writes depth)
+ *   Atmosphere     — renderOrder 2  (BackSide sphere, depth-tested)
  *   Country lines  — renderOrder 3
- *   Missiles/arcs  — renderOrder 4
+ *   Mist           — renderOrder 3
+ *   Missiles/arcs  — renderOrder 4+
+ *
+ * BUG FIXES (2026-02-26):
+ *   - Removed stale `fx` reference in FlatMapView cleanup (was undefined → threw)
+ *   - Added `key` prop to ThreeGlobe / FlatMapView to force clean unmount/remount
+ *     on mode switch — eliminates the green WebGL canvas bleed-through.
+ *   - Applied `globe-container` CSS class to all wrapper divs so index.css
+ *     vignette/glow rules take effect.
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
@@ -124,38 +132,7 @@ function buildStars(scene) {
   scene.add(pts)
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// ATMOSPHERE — BackSide sphere, radius 1.18
-//
-// KEY INSIGHT: THREE.BackSide renders the inward-facing normals.
-// From outside the sphere you see only the limb/rim because:
-//   • The globe mesh (FrontSide, r=1.0) writes to the depth buffer first
-//     (renderOrder 2 > renderOrder 1, drawn second but depth wins via
-//     standard depth test since atmo is drawn first into depth buffer
-//     and then globe overwrites it).
-//   Wait — correct order: we want globe depth written BEFORE atmo test.
-//   So: renderOrder 1 = atmosphere, renderOrder 2 = globe.
-//   Three.js renders lower renderOrder FIRST. Globe (2) renders AFTER.
-//   But depth test on atmo (1) runs BEFORE globe writes depth → atmo wins.
-//
-//   CORRECT ORDER for depth occlusion:
-//   Globe renderOrder LOWER than atmosphere so globe depth is written first:
-//     Globe       → renderOrder 1  (writes depth)
-//     Atmosphere  → renderOrder 2  (depth-tested against globe, rim only passes)
-//
-// The Fresnel rim formula: rim = 1 - |dot(viewDir, normal)|
-//   At globe centre face: dot≈1 → rim≈0 → alpha≈0 (transparent)
-//   At globe edge/limb:   dot≈0 → rim≈1 → alpha≈1 (bright glow)
-// ═══════════════════════════════════════════════════════════════════════
 function buildAtmosphere(scene) {
-  // ═══════════════════════════════════════════════════════════════════════
-  // BACKLIT PLANET — pixel-calibrated to match Kaspersky's radial profile.
-  // Analysis: Kaspersky green at edge ~24/255, decays to ~17 at r*1.5.
-  // decay constant k=0.7, peak alpha=0.08 matches within ~12% at all bands.
-  // Globe mesh (FrontSide renderOrder=1) writes depth → interior fully hidden.
-  // NO tight limb ring — single wide exponential falloff from globe surface.
-  // ═══════════════════════════════════════════════════════════════════════
-
   // Shell 1: Main corona — exponential falloff from globe edge outward
   const coronaMat = new THREE.ShaderMaterial({
     vertexShader: `
@@ -168,10 +145,7 @@ function buildAtmosphere(scene) {
     fragmentShader: `
       varying vec3 vWorld;
       void main() {
-        // Globe radius = 1.0 in world space
         float from_edge = length(vWorld) - 1.0;
-        // Exponential falloff: peaks at globe surface, wide smooth decay
-        // k=0.7 gives Kaspersky-matched profile (24→17 over 0.5r distance)
         float alpha = exp(-max(from_edge, 0.0) * 0.7) * 0.08;
         vec3  color = vec3(0.0, 1.0, 0.38);
         gl_FragColor = vec4(color, clamp(alpha, 0.0, 0.15));
@@ -187,8 +161,7 @@ function buildAtmosphere(scene) {
   coronaMesh.renderOrder = 2
   scene.add(coronaMesh)
 
-  // Shell 2: Wide space halo — very faint green ambient in space around globe
-  // Matches Kaspersky's background green tint visible in space region
+  // Shell 2: Wide space halo
   const haloMat = new THREE.ShaderMaterial({
     vertexShader: `
       varying vec3 vWorld;
@@ -201,7 +174,6 @@ function buildAtmosphere(scene) {
       varying vec3 vWorld;
       void main() {
         float from_edge = length(vWorld) - 1.0;
-        // Slower decay — spreads wide like Kaspersky background green glow
         float alpha = exp(-max(from_edge, 0.0) * 0.5) * 0.04;
         vec3  color = vec3(0.0, 0.85, 0.30);
         gl_FragColor = vec4(color, clamp(alpha, 0.0, 0.08));
@@ -217,7 +189,7 @@ function buildAtmosphere(scene) {
   haloMesh.renderOrder = 2
   scene.add(haloMesh)
 
-  // Shell 3: Evaporating mist — animated noise wisps (Kaspersky evaporating fog)
+  // Shell 3: Animated mist wisps
   const makeMistMat = (seed, amount) => new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
@@ -278,9 +250,6 @@ function buildAtmosphere(scene) {
   return { mistMats: [mist1.material, mist2.material] }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// GLOBE — renderOrder 1 (renders first, writes depth buffer)
-// ═══════════════════════════════════════════════════════════════════════
 function buildGlobe(scene) {
   const L    = new THREE.TextureLoader()
   const mesh = new THREE.Mesh(
@@ -292,7 +261,7 @@ function buildGlobe(scene) {
       bumpScale: .01, specular: new THREE.Color(0x1a3344), shininess: 6,
     })
   )
-  mesh.renderOrder = 1   // renders first → depth buffer filled → occludes atmosphere
+  mesh.renderOrder = 1
   scene.add(mesh)
 }
 
@@ -319,7 +288,6 @@ async function buildCountryBorders(scene) {
   } catch(e) { console.warn('3D borders:', e) }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
 function buildLabels3D(scene) {
   const labelObjects = []
   Object.entries(COUNTRIES).forEach(([code, { name, lat, lng }]) => {
@@ -562,8 +530,9 @@ function FlatMapView({ filteredArcs, speedLevel }) {
     }
     draw()
     return () => {
-      if (fx?.mistMats) fx.mistMats.forEach(m => m.dispose())
-      cancelAnimationFrame(rafRef.current); ro.disconnect()
+      // FIX: removed stale `fx` reference that caused ReferenceError on cleanup
+      cancelAnimationFrame(rafRef.current)
+      ro.disconnect()
       canvas.removeEventListener('mousedown',  onDown)
       canvas.removeEventListener('mousemove',  onMove)
       canvas.removeEventListener('mouseup',    onUp)
@@ -579,7 +548,7 @@ function FlatMapView({ filteredArcs, speedLevel }) {
   const resetZoom = ()  => { xfRef.current = { scale:1, tx:0, ty:0 } }
 
   return (
-    <div ref={containerRef} style={{ position:'absolute', inset:0, background:'#030d07', overflow:'hidden' }}>
+    <div ref={containerRef} className="globe-container" style={{ position:'absolute', inset:0, overflow:'hidden' }}>
       <canvas ref={canvasRef} style={{ display:'block', width:'100%', height:'100%', cursor:'grab' }} />
       <div style={{ position:'absolute', bottom:58, right:12, display:'flex', flexDirection:'column', gap:4, zIndex:20 }}>
         {[{ l:'+', f:1.5 },{ l:'\u2212', f:1/1.5 },{ l:'\u2302', f:null }].map(({ l, f }) => (
@@ -614,14 +583,20 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     const el = mountRef.current; if (!el) return
     const W = el.clientWidth || 800, H = el.clientHeight || 600
 
-    const scene  = new THREE.Scene()
-    const camera = new THREE.PerspectiveCamera(45, W/H, .1, 100)
-    camera.position.z = 2.5
-
-    const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true })
+    // FIX: alpha:false prevents transparent WebGL canvas from showing
+    // body/html background (the green #00ff88 variable) bleeding through
+    // when switching modes. setClearColor ensures canvas is always opaque.
+    const renderer = new THREE.WebGLRenderer({ antialias:true, alpha: false })
+    renderer.setClearColor(0x030a05, 1)  // matches --c-bg exactly
     renderer.setSize(W, H)
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     el.appendChild(renderer.domElement)
+
+    const scene  = new THREE.Scene()
+    scene.background = new THREE.Color(0x030a05)  // belt-and-suspenders: scene bg
+
+    const camera = new THREE.PerspectiveCamera(45, W/H, .1, 100)
+    camera.position.z = 2.5
 
     const css2d = new CSS2DRenderer()
     css2d.setSize(W, H)
@@ -646,11 +621,11 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     const sun = new THREE.DirectionalLight(0x88aacc, .45)
     sun.position.set(4, 2, 4); scene.add(sun)
 
-    buildStars(scene)          // renderOrder 0
-    buildGlobe(scene)          // renderOrder 1 — writes depth first
-    const fx = buildAtmosphere(scene)  // pixel-calibrated backlit planet corona
+    buildStars(scene)
+    buildGlobe(scene)
+    const fx = buildAtmosphere(scene)
     const labelObjects = buildLabels3D(scene)
-    buildCountryBorders(scene) // renderOrder 3
+    buildCountryBorders(scene)
 
     const missilesGrp = new THREE.Group()
     const trailsGrp   = new THREE.Group()
@@ -743,8 +718,10 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
 
     refs.current = { scene, missilesGrp, trailsGrp, spikesGrp, controls, renderer, css2d, el }
     return () => {
-      cancelAnimationFrame(rafId); window.removeEventListener('resize', onResize)
-      controls.dispose(); renderer.dispose()
+      cancelAnimationFrame(rafId)
+      window.removeEventListener('resize', onResize)
+      controls.dispose()
+      renderer.dispose()
       if (el.contains(renderer.domElement)) el.removeChild(renderer.domElement)
       if (el.contains(css2d.domElement))    el.removeChild(css2d.domElement)
     }
@@ -770,11 +747,13 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     })
   }, [filteredArcs])
 
-  return <div ref={mountRef} style={{ position:'relative', width:'100%', height:'100%' }} />
+  return <div ref={mountRef} className="globe-container" style={{ position:'relative', width:'100%', height:'100%' }} />
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// EXPORT
+// EXPORT — key prop forces full unmount/remount on mode switch
+// This is the correct fix for the green bg flash: the old WebGL canvas
+// is fully destroyed before the new component mounts.
 // ═══════════════════════════════════════════════════════════════════════
 export default function GlobeView() {
   const { globeView, heatmapActive, attacks, isRotating, speedLevel, selectedTypes, selectedSeverities } = useStore()
@@ -787,14 +766,14 @@ export default function GlobeView() {
 
   if (globeView === 'flat' || !webglOk) return (
     <div style={{ position:'relative', width:'100%', height:'100%' }}>
-      <FlatMapView filteredArcs={filteredArcs} speedLevel={speedLevel} />
+      <FlatMapView key="flat" filteredArcs={filteredArcs} speedLevel={speedLevel} />
       {!webglOk && <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-yellow-500/20 border border-yellow-500/40 text-yellow-300 text-xs px-3 py-1.5 rounded-lg">WebGL unavailable</div>}
     </div>
   )
 
   return (
-    <div style={{ position:'relative', width:'100%', height:'100%', background:'#000' }}>
-      <ThreeGlobe filteredArcs={filteredArcs} isRotating={isRotating} speedLevel={speedLevel} />
+    <div style={{ position:'relative', width:'100%', height:'100%' }}>
+      <ThreeGlobe key="globe" filteredArcs={filteredArcs} isRotating={isRotating} speedLevel={speedLevel} />
       {heatmapActive && <div className="absolute inset-0 pointer-events-none" style={{ background:'radial-gradient(ellipse at 35% 45%,rgba(0,60,200,.05) 0%,transparent 55%),radial-gradient(ellipse at 65% 55%,rgba(100,0,200,.04) 0%,transparent 50%)' }} />}
     </div>
   )
