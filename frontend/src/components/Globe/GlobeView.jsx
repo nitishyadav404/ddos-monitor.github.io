@@ -1,18 +1,17 @@
 /**
  * GlobeView.jsx — 3D Globe + 2D Flat Map
  *
- * 3D label fixes in this file:
- *  1. THREE.Sprite / THREE.SpriteMaterial restored (were corrupted).
- *  2. Altitude dropped from R+0.055 → R+0.006 so labels sit ON the globe.
- *  3. spr.center.set(0.5, 0) — bottom-anchors the sprite so the label
- *     base touches the lat/lng point rather than floating above it.
- *  4. Canvas resolution doubled (×2 devicePixelRatio trick) for crispness.
- *  5. Per-frame NDC collision cull unchanged (big-countries-first).
+ * LABEL APPROACH: CSS2DRenderer
+ *   - Real HTML <div> labels projected from 3D world positions onto the screen
+ *   - Text is always upright, readable, never mirrored or rotated
+ *   - Labels hide automatically when their country is on the back hemisphere
+ *   - Exactly how Google Maps / Kaspersky CyberMap places country names
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
 import * as topojson from 'topojson-client'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js'
 import useStore from '../../store/useStore.js'
 import { COUNTRIES } from '../../utils/constants.js'
 
@@ -20,8 +19,6 @@ const R        = 1.0
 const SEGMENTS = 80
 const TOPO_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json'
 
-// ── Size-bucket / priority table ─────────────────────────────────────────
-// Lower value = bigger country = higher label priority
 const MIN_ZOOM = {
   US:1.0,CN:1.0,RU:1.0,CA:1.0,BR:1.0,AU:1.0,IN:1.0,
   DZ:1.0,KZ:1.0,SA:1.0,AR:1.0,MX:1.0,ID:1.0,LY:1.0,
@@ -163,78 +160,50 @@ function buildAtmosphere(scene) {
 }
 
 /**
- * buildLabels3D — key fixes vs previous broken version:
- *  • THREE.Sprite / THREE.SpriteMaterial used correctly
- *  • spr.center.set(0.5, 0)  ← bottom-anchor: base of text = lat/lng point
- *  • altitude = R + 0.006    ← nearly touching the surface (was 0.055)
- *  • canvas drawn at 2× then downscaled for crisp texture
- *  • sorted big-first for collision priority
+ * buildLabels3D — CSS2DObject approach
+ *
+ * Places a real HTML <div> at each country's lat/lng position in 3D space.
+ * CSS2DRenderer projects the 3D point to screen coordinates each frame,
+ * so the label always appears AT that country — upright, readable, never
+ * rotated or mirrored. Exactly like Google Maps country labels.
+ *
+ * Visibility logic: hide when the country is on the back hemisphere
+ * (dot product of surface normal vs camera direction < 0.1).
  */
 function buildLabels3D(scene) {
-  const DPR  = 2
-  const UP   = new THREE.Vector3(0, 1, 0)
-  const items = []
+  const labelObjects = []
 
   Object.entries(COUNTRIES).forEach(([code, { name, lat, lng }]) => {
     const mz     = MIN_ZOOM[code] ?? 3.5
     const isCity = CITY_KEYS.has(code)
 
-    // Canvas texture
-    const fPx  = (mz <= 1.0 ? 22 : mz <= 1.5 ? 19 : mz <= 2.5 ? 16 : 13) * DPR
-    const label = name.toUpperCase()
-    const cW   = Math.max(100, label.length * fPx * 0.60 + 24) * DPR
-    const cH   = (fPx + 14) * DPR
-    const cv   = document.createElement('canvas')
-    cv.width = cW; cv.height = cH
-    const cx = cv.getContext('2d')
-    cx.clearRect(0, 0, cW, cH)
-    cx.font         = `600 ${fPx}px 'Courier New', monospace`
-    cx.textAlign    = 'center'
-    cx.textBaseline = 'middle'
-    cx.shadowColor  = 'rgba(0,0,0,1)'
-    cx.shadowBlur   = fPx * 0.55
-    const alpha     = mz <= 1.0 ? 1.0 : mz <= 1.5 ? 0.92 : mz <= 2.5 ? 0.82 : 0.72
-    cx.fillStyle    = isCity
-      ? `rgba(55,195,230,${alpha})`
-      : `rgba(60,230,130,${alpha})`
-    cx.fillText(label, cW / 2, cH / 2)
+    // Font size tier
+    const fs = mz <= 1.0 ? 11 : mz <= 1.5 ? 9.5 : mz <= 2.5 ? 8 : 7
 
-    // Plane mesh — NOT a Sprite, so no billboard/floating
-    const plW  = mz <= 1.0 ? 0.36 : mz <= 1.5 ? 0.28 : mz <= 2.5 ? 0.20 : 0.14
-    const mesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(plW, plW * (cH / cW)),
-      new THREE.MeshBasicMaterial({
-        map: new THREE.CanvasTexture(cv),
-        transparent: true,
-        depthWrite:  false,
-        side:        THREE.DoubleSide,
-      })
-    )
+    const div = document.createElement('div')
+    div.textContent = name
+    div.style.cssText = [
+      `font-family: 'Courier New', monospace`,
+      `font-size: ${fs}px`,
+      `font-weight: ${mz <= 1.5 ? '700' : '500'}`,
+      `color: ${isCity ? 'rgba(55,195,230,0.92)' : 'rgba(60,230,130,0.90)'}`,
+      `text-shadow: 0 0 4px rgba(0,0,0,1), 0 0 8px rgba(0,0,0,1)`,
+      `letter-spacing: 0.06em`,
+      `pointer-events: none`,
+      `white-space: nowrap`,
+      `user-select: none`,
+      `transform: translate(-50%, -50%)`,  // centre the label on the point
+    ].join(';')
 
-    // Place and orient the plane flat on the globe surface
-    const surfacePos = ll2v(lat, lng, R + 0.001)
-    mesh.position.copy(surfacePos)
-
-    const normal = surfacePos.clone().normalize()
-    let tangentUp = UP.clone()
-    if (Math.abs(normal.dot(UP)) > 0.98) tangentUp.set(0, 0, 1)
-    const tangentRight = new THREE.Vector3()
-      .crossVectors(normal, tangentUp).normalize()
-    tangentUp = new THREE.Vector3()
-      .crossVectors(tangentRight, normal).normalize()
-
-    mesh.setRotationFromMatrix(
-      new THREE.Matrix4().makeBasis(tangentRight, tangentUp, normal)
-    )
-
-    mesh.userData = { mz, maxDist: maxDistFor(mz) }
-    mesh.visible  = false
-    scene.add(mesh)
-    items.push({ mesh, mz })
+    const obj = new CSS2DObject(div)
+    obj.position.copy(ll2v(lat, lng, R + 0.01))  // sit just on the surface
+    obj.userData = { mz, maxDist: maxDistFor(mz), div }
+    obj.visible = false
+    scene.add(obj)
+    labelObjects.push(obj)
   })
 
-  items.sort((a, b) => a.mz - b.mz)
-  return items.map(i => i.mesh)
+  return labelObjects
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -398,7 +367,6 @@ function FlatMapView({ filteredArcs, speedLevel }) {
         })
       }
 
-      // ── Country labels (2D) ───────────────────────────────────────
       const entries = Object.entries(COUNTRIES)
       const sorted  = entries.slice().sort((a, b) => (MIN_ZOOM[a[0]] ?? 3.5) - (MIN_ZOOM[b[0]] ?? 3.5))
       ctx.textAlign    = 'center'
@@ -423,7 +391,6 @@ function FlatMapView({ filteredArcs, speedLevel }) {
         ctx.fillText(name, px, py); ctx.shadowBlur = 0
       })
 
-      // ── Dots ──────────────────────────────────────────────────────
       const dotR = Math.max(0.6, 1.2 / Math.sqrt(s))
       entries.forEach(([code, { lat, lng }]) => {
         if (CITY_KEYS.has(code) && s < 6) return
@@ -433,7 +400,6 @@ function FlatMapView({ filteredArcs, speedLevel }) {
         ctx.fillStyle = 'rgba(0,210,100,0.40)'; ctx.fill()
       })
 
-      // ── Missiles ──────────────────────────────────────────────────
       arcs.slice(0, 50).forEach(arc => {
         const st = arcStates.current[arc.id]; if (!st || st.alpha <= 0) return
         const col = arc.typeColor || '#00ff88'
@@ -522,13 +488,28 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
   useEffect(() => {
     const el = mountRef.current; if (!el) return
     const W = el.clientWidth || 800, H = el.clientHeight || 600
+
     const scene    = new THREE.Scene()
     const camera   = new THREE.PerspectiveCamera(45, W/H, .1, 100)
     camera.position.z = 2.5
+
+    // WebGL renderer
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
     renderer.setSize(W, H)
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     el.appendChild(renderer.domElement)
+
+    // CSS2D renderer — sits on top of the WebGL canvas, same size
+    const css2d = new CSS2DRenderer()
+    css2d.setSize(W, H)
+    css2d.domElement.style.cssText = [
+      'position:absolute',
+      'top:0', 'left:0',
+      'width:100%', 'height:100%',
+      'pointer-events:none',
+      'overflow:hidden',
+    ].join(';')
+    el.appendChild(css2d.domElement)
 
     const controls = new OrbitControls(camera, renderer.domElement)
     controls.enableDamping   = true
@@ -546,19 +527,19 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     buildStars(scene)
     buildGlobe(scene)
     buildAtmosphere(scene)
-    const labelMeshes = buildLabels3D(scene)   // sorted big-first //Also changed from labelSprites to labelMeshes
+    const labelObjects = buildLabels3D(scene)
     buildCountryBorders(scene)
 
     const missilesGrp = new THREE.Group(), trailsGrp = new THREE.Group(), spikesGrp = new THREE.Group()
     scene.add(missilesGrp, trailsGrp, spikesGrp)
 
     const onResize = () => {
-      camera.aspect = el.clientWidth / el.clientHeight; camera.updateProjectionMatrix()
-      renderer.setSize(el.clientWidth, el.clientHeight)
+      const nW = el.clientWidth, nH = el.clientHeight
+      camera.aspect = nW / nH; camera.updateProjectionMatrix()
+      renderer.setSize(nW, nH)
+      css2d.setSize(nW, nH)
     }
     window.addEventListener('resize', onResize)
-
-    const _ndc = new THREE.Vector3()
 
     let rafId
     const animate = () => {
@@ -568,15 +549,14 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
       const camDist = camera.position.length()
       const camNorm = camera.position.clone().normalize()
 
-      // ── Per-frame screen-space collision cull ─────────────────────
-      const screenBoxes = []
-
-      labelMeshes.forEach(mesh => {
-         const ud = mesh.userData
-          if (camDist > ud.maxDist) { mesh.visible = false; return }
-          const surfDir = mesh.position.clone().normalize()
-          mesh.visible = surfDir.dot(camNorm) > 0.15
-       })
+      // ── Label visibility: hide back-hemisphere + distance gate ────
+      labelObjects.forEach(obj => {
+        const ud = obj.userData
+        if (camDist > ud.maxDist) { obj.visible = false; return }
+        const surfDir = obj.position.clone().normalize()
+        // dot > 0.1 means the country is on the front-facing hemisphere
+        obj.visible = surfDir.dot(camNorm) > 0.1
+      })
 
       // ── Missiles ──────────────────────────────────────────────────
       const spd = SPD3D[speedRef.current] ?? SPD3D[1]
@@ -633,15 +613,18 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
       })
       spikesGrp.children.filter(s => s.userData.done).forEach(s => { s.geometry.dispose(); s.material.dispose(); spikesGrp.remove(s) })
       if (renderedRef.current.size > 600) renderedRef.current.clear()
+
       renderer.render(scene, camera)
+      css2d.render(scene, camera)   // render HTML labels on top
     }
     animate()
 
-    refs.current = { scene, missilesGrp, trailsGrp, spikesGrp, controls, renderer, el }
+    refs.current = { scene, missilesGrp, trailsGrp, spikesGrp, controls, renderer, css2d, el }
     return () => {
       cancelAnimationFrame(rafId); window.removeEventListener('resize', onResize)
       controls.dispose(); renderer.dispose()
       if (el.contains(renderer.domElement)) el.removeChild(renderer.domElement)
+      if (el.contains(css2d.domElement))    el.removeChild(css2d.domElement)
     }
   }, [])
 
@@ -652,8 +635,8 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     filteredArcs.slice(0, 60).forEach(arc => {
       if (renderedRef.current.has(arc.id)) return
       renderedRef.current.add(arc.id)
-      const pts   = arcPoints(arc)
-      const col   = new THREE.Color(arc.typeColor || '#00ff88')
+      const pts    = arcPoints(arc)
+      const col    = new THREE.Color(arc.typeColor || '#00ff88')
       const isCrit = arc.severity === 'critical'
       const ghost  = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: .06 }))
       const trail  = new THREE.Line(new THREE.BufferGeometry().setFromPoints([pts[0].clone(), pts[0].clone()]), new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: isCrit ? .95 : .72 }))
@@ -665,7 +648,7 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     })
   }, [filteredArcs])
 
-  return <div ref={mountRef} style={{ width: '100%', height: '100%' }} />
+  return <div ref={mountRef} style={{ position: 'relative', width: '100%', height: '100%' }} />
 }
 
 // ═══════════════════════════════════════════════════════════════════════
