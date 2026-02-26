@@ -1,17 +1,10 @@
 /**
  * GlobeView.jsx — 3D Globe + 2D Flat Map
  *
- * Atmosphere: BackSide shell at exactly 1.0R (globe surface).
- *
- * HOW THE GLOW WORKS:
- *   BackSide = we see the INNER face of the shell.
- *   At the silhouette edge the inner normal is perpendicular to the view
- *   → ndotv = 0 → rim = 1 → alpha = 1.0  (100 Lu, MAX at circumference)
- *   Toward the "top" of the shell (facing camera directly)
- *   → ndotv = 1 → rim = 0 → alpha = 0.0  (0 Lu, fully transparent in space)
- *
- *   Result: Glow starts at the EXACT globe edge and fades OUTWARD into space.
- *   100 Lu → 80 → 60 → 40 → 20 → 10 → 0 Lu  ✓
+ * Atmosphere: Canvas-texture sprite (billboard) centred on the globe.
+ * The texture is a radial ring: inner radius = globe edge (R in screen),
+ * outer radius fades to transparent in space. Always faces camera.
+ * This is EXACTLY how Kaspersky cybermap does it.
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
@@ -152,124 +145,92 @@ async function buildCountryBorders(scene) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// ATMOSPHERE — BackSide shell at exactly R (globe surface radius)
+// ATMOSPHERE — Canvas sprite billboard (always faces camera)
 //
-// BackSide: we render the INNER face of the sphere.
-// The inner face normal points INWARD (toward globe centre).
-// When projected to view space:
-//   ndotv = dot(inner_normal, viewDir)
-//   At the silhouette ring → inner normal ⊥ viewDir → ndotv ≈ 0
-//   Directly behind globe  → inner normal ∥ viewDir → ndotv ≈ 1
+// Strategy: draw a 512×512 canvas ring texture where:
+//   - The INNER edge of the ring sits exactly at globe radius R
+//   - Moving outward (away from Earth into space) the glow fades to 0
+//   - The quad is sized at 2.6R so the outer glow blends into space
 //
-// We want MAX glow at the silhouette (circumference), zero elsewhere:
-//   rim = 1.0 - ndotv   → 1 at silhouette edge, 0 at pole
-//   alpha = pow(rim, N) → bright ring at edge, fades outward into space ✓
-//
-// The shell radius is 1.18R — just enough to peek around the globe edge
-// and project the halo outward into space without overlapping the surface.
+// This is camera-facing (SpriteMaterial) so it always looks correct
+// from any viewing angle — the same technique Kaspersky uses.
 // ═══════════════════════════════════════════════════════════════════════
-const ATMO_VERT = /* glsl */`
-  varying vec3 vWorldPos;
-  varying vec3 vNormal;
-  varying vec3 vViewDir;
-  void main() {
-    vec4 wp     = modelMatrix * vec4(position, 1.0);
-    vWorldPos   = wp.xyz;
-    vNormal     = normalize(normalMatrix * normal);
-    vec4 mv     = modelViewMatrix * vec4(position, 1.0);
-    vViewDir    = normalize(-mv.xyz);
-    gl_Position = projectionMatrix * mv;
-  }
-`
+function makeHaloTexture() {
+  const SIZE = 512
+  const c    = document.createElement('canvas')
+  c.width = c.height = SIZE
+  const ctx = c.getContext('2d')
 
-const ATMO_FRAG = /* glsl */`
-  uniform float uTime;
-  varying vec3  vWorldPos;
-  varying vec3  vNormal;
-  varying vec3  vViewDir;
+  const cx = SIZE / 2
+  // Inner radius = globe edge in texture space
+  // Outer radius = how far the glow extends into space
+  const innerR = SIZE * 0.385   // ≈ globe circumference
+  const outerR = SIZE * 0.500   // glow bleeds this far outward into space
 
-  // ── noise helpers ──────────────────────────────────────────────
-  float hash31(vec3 p) {
-    p  = fract(p * vec3(127.1, 311.7, 74.7));
-    p += dot(p, p.yzx + 19.19);
-    return fract((p.x + p.y) * p.z);
-  }
-  float vnoise(vec3 p) {
-    vec3 i = floor(p); vec3 f = fract(p);
-    vec3 u = f*f*(3.0-2.0*f);
-    float a=hash31(i),           b=hash31(i+vec3(1,0,0)),
-          c=hash31(i+vec3(0,1,0)),d=hash31(i+vec3(1,1,0)),
-          e=hash31(i+vec3(0,0,1)),g=hash31(i+vec3(1,0,1)),
-          h=hash31(i+vec3(0,1,1)),k=hash31(i+vec3(1,1,1));
-    return mix(mix(mix(a,b,u.x),mix(c,d,u.x),u.y),
-               mix(mix(e,g,u.x),mix(h,k,u.x),u.y),u.z);
-  }
-  float fbm(vec3 p) {
-    float v=0.,amp=0.5,freq=1.;
-    for(int i=0;i<3;i++){v+=amp*vnoise(p*freq);freq*=2.1;amp*=0.48;}
-    return v;
-  }
+  // ── 1. Base radial glow ring ──────────────────────────────────────
+  const grad = ctx.createRadialGradient(cx, cx, innerR, cx, cx, outerR)
+  grad.addColorStop(0.00, 'rgba(0,255,100, 0.95)')  // 100 Lu — at globe edge
+  grad.addColorStop(0.15, 'rgba(0,230,80,  0.70)')  // 80 Lu
+  grad.addColorStop(0.35, 'rgba(0,200,60,  0.40)')  // 60 Lu
+  grad.addColorStop(0.55, 'rgba(0,160,40,  0.18)')  // 40 Lu
+  grad.addColorStop(0.75, 'rgba(0,120,30,  0.06)')  // 20 Lu
+  grad.addColorStop(0.90, 'rgba(0, 80,20,  0.02)')  // 10 Lu
+  grad.addColorStop(1.00, 'rgba(0,  0, 0,  0.00)')  //  0 Lu — gone
+  ctx.fillStyle = grad
+  ctx.fillRect(0, 0, SIZE, SIZE)
 
-  void main() {
-    // ndotv: 0 = silhouette edge of shell, 1 = pole facing camera
-    float ndotv = abs(dot(vNormal, vViewDir));
+  // ── 2. Punch out the inner circle (globe itself = black/transparent) 
+  // This removes glow INSIDE the globe so it only shows around the edge
+  ctx.globalCompositeOperation = 'destination-out'
+  ctx.beginPath()
+  ctx.arc(cx, cx, innerR - 1, 0, Math.PI * 2)
+  ctx.fillStyle = 'rgba(0,0,0,1)'
+  ctx.fill()
+  ctx.globalCompositeOperation = 'source-over'
 
-    // rim: 1 at silhouette edge (globe circumference) → MAX glow here
-    //      0 at pole (facing space directly)          → transparent
-    float rim = 1.0 - ndotv;
-    rim = clamp(rim, 0.0, 1.0);
+  // ── 3. Thin bright ring exactly at the globe circumference ────────
+  // This is the crisp bright line at the exact globe edge (like Kaspersky)
+  const ringGrad = ctx.createRadialGradient(cx, cx, innerR - 3, cx, cx, innerR + 8)
+  ringGrad.addColorStop(0,   'rgba(80,255,140, 0.0)')
+  ringGrad.addColorStop(0.3, 'rgba(80,255,140, 0.9)')
+  ringGrad.addColorStop(0.6, 'rgba(40,220,100, 0.6)')
+  ringGrad.addColorStop(1,   'rgba(0, 180, 60, 0.0)')
+  ctx.fillStyle = ringGrad
+  ctx.beginPath()
+  ctx.arc(cx, cx, innerR + 8, 0, Math.PI * 2)
+  ctx.fill()
+  // punch inner again to keep globe area clean
+  ctx.globalCompositeOperation = 'destination-out'
+  ctx.beginPath()
+  ctx.arc(cx, cx, innerR - 3, 0, Math.PI * 2)
+  ctx.fillStyle = 'rgba(0,0,0,1)'
+  ctx.fill()
+  ctx.globalCompositeOperation = 'source-over'
 
-    // ── BASE GLOW: peaks at rim=1 (circumference), decays outward ──
-    // pow exponent controls width of the halo band:
-    //   low  (1.5) = wide  soft halo
-    //   high (6.0) = tight thin ring
-    // 2.5 gives a natural atmospheric width, like Kaspersky
-    float glow  = pow(rim, 2.5);
-    float alpha = glow * 0.88;
-
-    // ── ANIMATED WISPY MIST — only near the silhouette band ────────
-    // Gate: only visible when rim > 0.55, peaks at rim > 0.75
-    float rimGate = smoothstep(0.55, 0.78, rim);
-    vec3  p1 = vWorldPos * 2.8 + vec3( uTime*0.055,  uTime*0.038, -uTime*0.028);
-    vec3  p2 = vWorldPos * 5.2 + vec3(-uTime*0.092,  uTime*0.070,  uTime*0.048);
-    float n   = fbm(p1) + fbm(p2) * 0.42;
-    float mist = smoothstep(0.48, 1.0, n) * rimGate * 0.28;
-
-    // ── COMBINE ─────────────────────────────────────────────────────
-    float finalAlpha = alpha + mist;
-    if (finalAlpha < 0.004) discard;
-    finalAlpha = min(finalAlpha, 0.94);
-
-    // Colour: bright cyber-green at circumference edge (rim=1)
-    //         deep dark green toward space (rim=0)
-    vec3 edgeCol = vec3(0.08, 1.00, 0.42);  // full bright at globe edge
-    vec3 fadeCol = vec3(0.00, 0.28, 0.10);  // near-black far from globe
-    vec3 col     = mix(fadeCol, edgeCol, glow);
-    col = mix(col, vec3(0.12, 1.0, 0.52), mist / max(finalAlpha, 0.001));
-
-    gl_FragColor = vec4(col, finalAlpha);
-  }
-`
+  return new THREE.CanvasTexture(c)
+}
 
 function buildAtmosphere(scene) {
-  const mat = new THREE.ShaderMaterial({
-    uniforms:      { uTime: { value: 0.0 } },
-    vertexShader:   ATMO_VERT,
-    fragmentShader: ATMO_FRAG,
-    // BackSide: renders inner face of sphere
-    // The inner normals point inward — at the silhouette ring they are
-    // perpendicular to the view ray, giving rim=1 (max glow) at the
-    // exact globe circumference. The halo fans outward from there.
-    side:        THREE.BackSide,
-    blending:    THREE.AdditiveBlending,
+  const tex = makeHaloTexture()
+  // SpriteMaterial = always faces the camera (billboard)
+  // The sprite quad is sized 2 * halySize world units
+  // innerR/SIZE = 0.385, so 1 globe radius = 0.385 of texture
+  // To map innerR to R=1.0: spriteScale = 1.0 / 0.385 * 0.5 = 1.30
+  // Full sprite = 2 * 1.30 = 2.60 world units wide (covers globe + halo)
+  const mat = new THREE.SpriteMaterial({
+    map:        tex,
+    blending:   THREE.AdditiveBlending,
     transparent: true,
     depthWrite:  false,
     depthTest:   false,
+    opacity:     1.0,
   })
-  // 1.18R: shell slightly larger than globe so the halo is visible
-  // around the silhouette without clipping into the surface
-  scene.add(new THREE.Mesh(new THREE.SphereGeometry(R * 1.18, 64, 64), mat))
-  return mat
+  const sprite = new THREE.Sprite(mat)
+  // Scale so the inner ring of the texture aligns with the globe circumference
+  const s = (1.0 / 0.385) * 0.5 * 2   // = 2.597 ≈ 2.6
+  sprite.scale.set(s, s, 1)
+  scene.add(sprite)
+  return { mat, tex, sprite }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -600,7 +561,7 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
 
     buildStars(scene)
     buildGlobe(scene)
-    const atmoMat = buildAtmosphere(scene)
+    buildAtmosphere(scene)   // canvas sprite halo
     const labelObjects = buildLabels3D(scene)
     buildCountryBorders(scene)
 
@@ -621,7 +582,6 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     const animate = () => {
       rafId = requestAnimationFrame(animate)
       controls.update()
-      atmoMat.uniforms.uTime.value = clock.getElapsedTime()
 
       const camDist = camera.position.length()
       const camNorm = camera.position.clone().normalize()
