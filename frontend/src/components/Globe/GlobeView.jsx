@@ -1,9 +1,11 @@
 /**
  * GlobeView.jsx — 3D Globe + 2D Flat Map
  *
- * Cyberthreat Atmosphere (fixed):
- *   Mist  — BackSide sphere 1.18R: noise only in the outermost rim band, never on globe face
- *   Glow  — BackSide sphere 1.5R:  wide Fresnel halo that bleeds into space
+ * Atmosphere: ONE BackSide sphere at 1.5R.
+ * Single shader blends:
+ *   • A wide soft Fresnel halo (glow) that bleeds into space
+ *   • Animated noise wisps confined to the outermost rim band
+ * Result: Kaspersky-style single atmospheric haze — no double ring.
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
@@ -144,81 +146,34 @@ async function buildCountryBorders(scene) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// FEATURE 2 — Evaporating Glow  (1.5R, BackSide)
-// Wide Fresnel halo that pushes deep into space.
-// BackSide + large radius = the glow is ONLY visible outside the globe
-// circumference, never as a green layer on top of the earth texture.
+// UNIFIED ATMOSPHERE — single BackSide shell at 1.5R
+// One shader = one ring around the globe silhouette.
+// Combines:
+//   • Wide soft Fresnel halo (glow) decaying into space
+//   • Subtle animated noise wisps only in the outermost rim band
+// NO second sphere. No double bubble.
 // ═══════════════════════════════════════════════════════════════════════
-const GLOW_VERT = /* glsl */`
-  varying vec3 vNormal;
-  varying vec3 vViewDir;
-  void main() {
-    vNormal  = normalize(normalMatrix * normal);
-    vec4 mv  = modelViewMatrix * vec4(position, 1.0);
-    vViewDir = normalize(-mv.xyz);
-    gl_Position = projectionMatrix * mv;
-  }
-`
-const GLOW_FRAG = /* glsl */`
-  varying vec3 vNormal;
-  varying vec3 vViewDir;
-  void main() {
-    // rim = 0 at face-on, 1 at grazing edge
-    float rim    = 1.0 - abs(dot(vNormal, vViewDir));
-    rim          = clamp(rim, 0.0, 1.0);
-
-    // Soft wide band: low power so glow fans wide into space
-    float rimPow = pow(rim, 1.8);
-
-    // Exponential density: strongest right at the limb, fades to 0 outward
-    float density = exp(-3.0 * (1.0 - rim));
-    float alpha   = rimPow * density * 0.72;
-
-    // Colour: inner edge brighter, outer edge deeper green
-    vec3 col = mix(vec3(0.0, 0.55, 0.22), vec3(0.0, 1.0, 0.4), rimPow);
-    gl_FragColor = vec4(col, alpha);
-  }
-`
-
-function buildAtmosphere(scene) {
-  scene.add(new THREE.Mesh(
-    new THREE.SphereGeometry(R * 1.5, 64, 64),   // 1.5R as requested
-    new THREE.ShaderMaterial({
-      vertexShader:   GLOW_VERT,
-      fragmentShader: GLOW_FRAG,
-      side:        THREE.BackSide,   // only renders the inward-facing shell
-      blending:    THREE.AdditiveBlending,
-      transparent: true,
-      depthWrite:  false,
-    })
-  ))
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// FEATURE 1 — Boiling Mist  (1.18R, BackSide)
-// BackSide on a sphere larger than the globe = fragments are only drawn
-// in the ring around the silhouette (outside the opaque earth disc).
-// The noise drives wispy vapour clouds erupting outward from the surface.
-// ═══════════════════════════════════════════════════════════════════════
-const MIST_VERT = /* glsl */`
+const ATMO_VERT = /* glsl */`
   varying vec3 vWorldPos;
   varying vec3 vNormal;
   varying vec3 vViewDir;
   void main() {
-    vec4 wp  = modelMatrix * vec4(position, 1.0);
-    vWorldPos = wp.xyz;
-    vNormal   = normalize(normalMatrix * normal);
-    vec4 mv   = modelViewMatrix * vec4(position, 1.0);
-    vViewDir  = normalize(-mv.xyz);
+    vec4 wp     = modelMatrix * vec4(position, 1.0);
+    vWorldPos   = wp.xyz;
+    vNormal     = normalize(normalMatrix * normal);
+    vec4 mv     = modelViewMatrix * vec4(position, 1.0);
+    vViewDir    = normalize(-mv.xyz);
     gl_Position = projectionMatrix * mv;
   }
 `
-const MIST_FRAG = /* glsl */`
+
+const ATMO_FRAG = /* glsl */`
   uniform float uTime;
   varying vec3  vWorldPos;
   varying vec3  vNormal;
   varying vec3  vViewDir;
 
+  // ── compact hash noise ──────────────────────────────────────────
   float hash31(vec3 p) {
     p  = fract(p * vec3(127.1, 311.7, 74.7));
     p += dot(p, p.yzx + 19.19);
@@ -227,7 +182,7 @@ const MIST_FRAG = /* glsl */`
   float vnoise(vec3 p) {
     vec3 i = floor(p); vec3 f = fract(p);
     vec3 u = f*f*(3.0-2.0*f);
-    float a=hash31(i),           b=hash31(i+vec3(1,0,0)),
+    float a=hash31(i),b=hash31(i+vec3(1,0,0)),
           c=hash31(i+vec3(0,1,0)),d=hash31(i+vec3(1,1,0)),
           e=hash31(i+vec3(0,0,1)),g=hash31(i+vec3(1,0,1)),
           h=hash31(i+vec3(0,1,1)),k=hash31(i+vec3(1,1,1));
@@ -240,48 +195,55 @@ const MIST_FRAG = /* glsl */`
     return v;
   }
 
-  const vec3 CYBER_GREEN = vec3(0.0, 1.0,  0.4);
-  const vec3 DEEP_GREEN  = vec3(0.0, 0.55, 0.22);
-
   void main() {
-    // Rim factor: 0 = face-on, 1 = grazing (the outer ring)
+    // rim = 0 face-on, 1 at grazing edge
     float rim = 1.0 - abs(dot(vNormal, vViewDir));
     rim = clamp(rim, 0.0, 1.0);
 
-    // ── Only show mist in the outer rim band ──────────────────────
-    // smoothstep gate: nothing below rim 0.55, full contribution at 0.75+
-    // This strictly confines the mist to outside the visible globe disc.
-    float rimGate = smoothstep(0.55, 0.78, rim);
-    if (rimGate < 0.001) discard;
+    // ── BASE GLOW ─────────────────────────────────────────────────
+    // Soft wide Fresnel that fans into space (low power = wide band)
+    float glowBase  = pow(rim, 2.2);
+    // Exponential density: dense at limb, zero toward centre of disc
+    float density   = exp(-2.8 * (1.0 - rim));
+    float glowAlpha = glowBase * density * 0.68;
 
-    // Animated noise
-    vec3 p1 = vWorldPos * 2.8 + vec3( uTime*0.06,  uTime*0.045, -uTime*0.035);
-    vec3 p2 = vWorldPos * 5.2 + vec3(-uTime*0.10,  uTime*0.08,   uTime*0.055);
-    float n  = fbm(p1) + fbm(p2)*0.5;
+    // ── WISPY MIST — only in outermost rim band ───────────────────
+    // rimGate kills anything below the horizon (rim < 0.60)
+    // so mist NEVER touches the globe face
+    float rimGate = smoothstep(0.60, 0.80, rim);
+    vec3  p1 = vWorldPos * 2.6 + vec3( uTime*0.055, uTime*0.040, -uTime*0.030);
+    vec3  p2 = vWorldPos * 5.0 + vec3(-uTime*0.095, uTime*0.075,  uTime*0.050);
+    float n  = fbm(p1) + fbm(p2) * 0.45;
+    float mist = smoothstep(0.52, 1.0, n) * rimGate * 0.30;
 
-    // Threshold for ethereal patches
-    float mist = smoothstep(0.55, 1.0, n);
+    // ── COMBINE ───────────────────────────────────────────────────
+    float alpha = glowAlpha + mist;
+    if (alpha < 0.005) discard;
+    alpha = min(alpha, 0.92); // never fully opaque
 
-    // Combine: rim gates position, mist gates shape
-    float alpha = mist * rimGate * 0.45;
-    if (alpha < 0.008) discard;
+    // Colour: deep green at base, bright cyber-green at edge wisps
+    vec3 baseCol = mix(vec3(0.0, 0.45, 0.18), vec3(0.0, 1.0, 0.4), glowBase);
+    vec3 mistCol = vec3(0.0, 1.0, 0.45);
+    vec3 col     = mix(baseCol, mistCol, mist / max(alpha, 0.001));
 
-    vec3 col = mix(DEEP_GREEN, CYBER_GREEN, mist * rimGate);
     gl_FragColor = vec4(col, alpha);
   }
 `
 
-function buildMist(scene) {
+/**
+ * buildAtmosphere — single shell, returns mat so animate loop ticks uTime.
+ */
+function buildAtmosphere(scene) {
   const mat = new THREE.ShaderMaterial({
     uniforms:      { uTime: { value: 0.0 } },
-    vertexShader:   MIST_VERT,
-    fragmentShader: MIST_FRAG,
-    side:        THREE.BackSide,       // KEY FIX: BackSide = only outside ring visible
+    vertexShader:   ATMO_VERT,
+    fragmentShader: ATMO_FRAG,
+    side:        THREE.BackSide,
     blending:    THREE.AdditiveBlending,
     transparent: true,
     depthWrite:  false,
   })
-  scene.add(new THREE.Mesh(new THREE.SphereGeometry(R * 1.18, 48, 48), mat))
+  scene.add(new THREE.Mesh(new THREE.SphereGeometry(R * 1.5, 64, 64), mat))
   return mat
 }
 
@@ -614,9 +576,8 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     buildStars(scene)
     buildGlobe(scene)
 
-    // Render order: Glow first (widest, outermost), then Mist (tighter ring)
-    buildAtmosphere(scene)        // 1.5R  BackSide glow
-    const mistMat = buildMist(scene)   // 1.18R BackSide noise mist
+    // ONE atmosphere shell — unified glow + mist in a single shader
+    const atmoMat = buildAtmosphere(scene)
 
     const labelObjects = buildLabels3D(scene)
     buildCountryBorders(scene)
@@ -639,7 +600,7 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     const animate = () => {
       rafId = requestAnimationFrame(animate)
       controls.update()
-      mistMat.uniforms.uTime.value = clock.getElapsedTime()
+      atmoMat.uniforms.uTime.value = clock.getElapsedTime()
 
       const camDist = camera.position.length()
       const camNorm = camera.position.clone().normalize()
