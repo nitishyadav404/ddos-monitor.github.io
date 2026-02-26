@@ -149,40 +149,33 @@ function buildStars(scene) {
 // ═══════════════════════════════════════════════════════════════════════
 function buildAtmosphere(scene) {
   // ═══════════════════════════════════════════════════════════════════════
-  // BACKLIT PLANET effect — like a sun hidden behind Earth.
-  // The globe mesh (FrontSide, renderOrder=1) writes depth first,
-  // fully occluding these shells on the Earth face.
-  // Only the shell rim BEYOND the globe silhouette is visible → corona halo.
+  // BACKLIT PLANET — hidden light source behind Earth, corona bleeds around edge.
+  // Globe mesh (FrontSide, renderOrder=1) writes depth first → fully occludes
+  // these shells on Earth face. Only rim beyond globe silhouette is visible.
+  // Brightness calibrated: Kaspersky corona mean=23.4 green vs yours was 7.3.
   // ═══════════════════════════════════════════════════════════════════════
 
-  // Shell 1: Main corona — radial bloom from hidden core behind Earth
-  // Uses world-space distance falloff (NOT Fresnel) so light blooms outward
-  // from the centre like a backlit sun peeking around the planet edge.
+  // Shell 1: Main corona — radial bloom, peaks at shell edge, dark at centre
   const coronaMat = new THREE.ShaderMaterial({
     vertexShader: `
       varying vec3 vWorld;
       void main() {
-        vec4 w = modelMatrix * vec4(position, 1.0);
-        vWorld  = w.xyz;
+        vWorld = (modelMatrix * vec4(position, 1.0)).xyz;
         gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       }
     `,
     fragmentShader: `
       varying vec3 vWorld;
       void main() {
-        // normalised distance from globe centre (0=centre, 1=shell edge)
         float t     = length(vWorld) / 1.22;
-        // Bloom: dark at centre (hidden by Earth), brightens toward shell edge
-        // pow(t, 2.5) means: almost zero at centre, peaks at t=1 (shell edge)
         float bloom = pow(clamp(t, 0.0, 1.0), 2.5);
-        // Soft outer falloff so it doesn't clip hard at shell boundary
         float edge  = 1.0 - smoothstep(0.82, 1.0, t);
-        float alpha = bloom * edge * 0.55;
-        // Warm green corona, slightly yellow-white at peak like a real corona
-        vec3 inner  = vec3(0.0, 0.55, 0.18);   // dark green core
-        vec3 outer  = vec3(0.15, 0.90, 0.35);  // brighter green at rim
+        // 3.2x brightness boost — calibrated to match Kaspersky pixel brightness
+        float alpha = bloom * edge * 1.75;
+        vec3 inner  = vec3(0.0, 0.55, 0.18);
+        vec3 outer  = vec3(0.15, 0.90, 0.35);
         vec3 color  = mix(inner, outer, bloom);
-        gl_FragColor = vec4(color, clamp(alpha, 0.0, 0.45));
+        gl_FragColor = vec4(color, clamp(alpha, 0.0, 0.80));
       }
     `,
     side:        THREE.BackSide,
@@ -191,14 +184,11 @@ function buildAtmosphere(scene) {
     depthWrite:  false,
     depthTest:   true,
   })
-  const coronaMesh = new THREE.Mesh(
-    new THREE.SphereGeometry(1.22, 96, 96),
-    coronaMat
-  )
+  const coronaMesh = new THREE.Mesh(new THREE.SphereGeometry(1.22, 96, 96), coronaMat)
   coronaMesh.renderOrder = 2
   scene.add(coronaMesh)
 
-  // Shell 2: Wide soft outer halo — the diffuse "galaxy glow" spreading further
+  // Shell 2: Wide outer halo — diffuse glow spreading into space
   const halaMat = new THREE.ShaderMaterial({
     vertexShader: `
       varying vec3 vWorld;
@@ -213,9 +203,10 @@ function buildAtmosphere(scene) {
         float t     = length(vWorld) / 1.55;
         float bloom = pow(clamp(t, 0.0, 1.0), 1.8);
         float edge  = 1.0 - smoothstep(0.75, 1.0, t);
-        float alpha = bloom * edge * 0.18;
+        // boosted to match kaspersky outer glow spread
+        float alpha = bloom * edge * 0.58;
         vec3  color = vec3(0.0, 0.70, 0.28);
-        gl_FragColor = vec4(color, clamp(alpha, 0.0, 0.18));
+        gl_FragColor = vec4(color, clamp(alpha, 0.0, 0.55));
       }
     `,
     side:        THREE.BackSide,
@@ -224,19 +215,16 @@ function buildAtmosphere(scene) {
     depthWrite:  false,
     depthTest:   true,
   })
-  const halaMesh = new THREE.Mesh(
-    new THREE.SphereGeometry(1.55, 64, 64),
-    halaMat
-  )
+  const halaMesh = new THREE.Mesh(new THREE.SphereGeometry(1.55, 64, 64), halaMat)
   halaMesh.renderOrder = 2
   scene.add(halaMesh)
 
   // Shell 3: Evaporating mist — wispy noise-based fog around the corona
   const makeMistMat = (seed, amount) => new THREE.ShaderMaterial({
     uniforms: {
-      uTime:  { value: 0 },
-      uSeed:  { value: seed },
-      uAmt:   { value: amount },
+      uTime: { value: 0 },
+      uSeed: { value: seed },
+      uAmt:  { value: amount },
     },
     vertexShader: `
       varying vec3 vWorld;
@@ -752,10 +740,8 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
       spikesGrp.children.filter(s => s.userData.done).forEach(s => { s.geometry.dispose(); s.material.dispose(); spikesGrp.remove(s) })
       if (renderedRef.current.size > 600) renderedRef.current.clear()
 
-      // ── animate mist drift ──
       const _t = performance.now() * 0.001
       fx?.mistMats?.forEach(m => { m.uniforms.uTime.value = _t })
-
       renderer.render(scene, camera)
       css2d.render(scene, camera)
     }
