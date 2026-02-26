@@ -1,21 +1,23 @@
 /**
  * GlobeView.jsx
  *
- * 2D Flat Map — label overhaul:
- *   - Zoom-aware culling: each country has a minZoom threshold
- *     based on its geographic size. Tiny countries only appear
- *     at high zoom so Europe doesn't look like a word salad.
- *   - Font: 500-weight (not bold) for cleaner, thinner look.
- *   - Font size capped at 11px, scales with zoom.
- *   - Collision suppression: rendered label bounding boxes are
- *     tracked; any label whose box overlaps an already-drawn one
- *     is skipped entirely.
+ * 3D Globe label fix:
+ *   - Per-frame screen-space AABB collision detection for sprites.
+ *     Each frame, every visible sprite is projected to NDC coords;
+ *     if its screen box overlaps a higher-priority (bigger country)
+ *     already-accepted sprite it is hidden for that frame.
+ *   - maxDist thresholds tightened per size group using MIN_ZOOM:
+ *       giant   → always (Infinity)
+ *       large   → 2.4
+ *       medium  → 1.9
+ *       small   → 1.55
+ *       tiny    → 1.38
+ *       cities  → 1.28
+ *   - Sprites sorted by priority (big country first) so large nations
+ *     always win the collision check against small neighbours.
+ *   - Thinner 500-weight font, smaller canvas, no bold globs.
  *
- * 2D border lines fix (from previous commit) kept intact:
- *   - Each country gets its own beginPath + stroke.
- *
- * 3D Globe:
- *   - Labels from full COUNTRIES constant (all 180+ entries).
+ * 2D map unchanged (already fixed in previous commit).
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
@@ -28,48 +30,34 @@ const R        = 1.0
 const SEGMENTS = 80
 const TOPO_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json'
 
-// ── minZoom table ────────────────────────────────────────────────────────
-// Scale factor at which a country label first becomes visible.
-// 1 = world view, 14 = maximum zoom.
-// Group logic:
-//   Giant  (>3M km²)  → 1.0   always visible
-//   Large  (1–3M km²) → 1.5
-//   Medium (300k–1M)  → 2.5
-//   Small  (50–300k)  → 3.5
-//   Tiny   (<50k)     → 5.0
-//   City codes        → 6.0   only at city-level zoom
+// ── Size bucket for every country code ───────────────────────────────────
+// minZoom doubles as priority — smaller value = bigger country = higher priority
 const MIN_ZOOM = {
-  // ── Giant ──────────────────────────────────────────────────────────────
-  US:1.0, CN:1.0, RU:1.0, CA:1.0, BR:1.0, AU:1.0, IN:1.0,
-  DZ:1.0, KZ:1.0, SA:1.0, AR:1.0, MX:1.0, ID:1.0, LY:1.0,
-  IR:1.0, MN:1.0, PE:1.0, CD:1.0, SD:1.0, AO:1.0, ML:1.0,
-  // ── Large ─────────────────────────────────────────────────────────────
-  ZA:1.5, CO:1.5, ET:1.5, MZ:1.5, BO:1.5, MG:1.5, TZ:1.5,
-  NG:1.5, VE:1.5, PK:1.5, AF:1.5, SO:1.5, CL:1.5, ZM:1.5,
-  MM:1.5, TD:1.5, CF:1.5, NA:1.5, MR:1.5, EG:1.5, TR:1.5,
-  NE:1.5, UA:1.5, GB:1.5, FR:1.5, DE:1.5, JP:1.5, PH:1.5,
-  SE:1.5, NO:1.5, FI:1.5, PG:1.5, MY:1.5, VN:1.5, TH:1.5,
-  TM:1.5, KE:1.5, UZ:1.5, BY:1.5, KR:1.5, IT:1.5, ES:1.5,
-  PL:1.5, ZW:1.5, CM:1.5, SS:1.5, BF:1.5, MK:1.5,
-  // ── Medium ────────────────────────────────────────────────────────────
-  UG:2.5, GH:2.5, RO:2.5, IQ:2.5, MA:2.5, UY:2.5, SY:2.5,
-  KH:2.5, TN:2.5, YE:2.5, PT:2.5, AZ:2.5, GE:2.5, AT:2.5,
-  GR:2.5, BG:2.5, HU:2.5, CZ:2.5, RS:2.5, KG:2.5, TJ:2.5,
-  PY:2.5, NZ:2.5, EC:2.5, CG:2.5, GN:2.5, NP:2.5, BD:2.5,
-  OA:2.5, GA:2.5, MW:2.5, ER:2.5, SL:2.5, GY:2.5, SR:2.5,
-  LA:2.5, HN:2.5, GT:2.5, GW:2.5, BJ:2.5, TG:2.5, BI:2.5,
-  RW:2.5, LK:2.5, KW:2.5, OM:2.5, AM:2.5, LR:2.5, NI:2.5,
-  // ── Small ─────────────────────────────────────────────────────────────
-  DK:3.5, SK:3.5, FJ:3.5, TL:3.5, CR:3.5, PA:3.5, BT:3.5,
-  SZ:3.5, LS:3.5, GQ:3.5, DJ:3.5, DO:3.5, HT:3.5, JM:3.5,
-  CU:3.5, AE:3.5, JO:3.5, LB:3.5, IL:3.5, PS:3.5, CY:3.5,
-  AL:3.5, MK:3.5, BA:3.5, HR:3.5, SI:3.5, BE:3.5, NL:3.5,
-  CH:3.5, IE:3.5, LT:3.5, LV:3.5, EE:3.5, MD:3.5, ME:3.5,
-  BW:3.5, ZW:3.5, SG:3.5, TW:3.5, HK:3.5, BN:3.5, MV:3.5,
-  BH:3.5, QA:3.5, IS:3.5, CV:3.5, KM:3.5, TT:3.5,
-  // ── Tiny ──────────────────────────────────────────────────────────────
-  LU:5.0, MT:5.0, BZ:5.0, SV:5.0, GM:5.0,
-  // ── Cities ────────────────────────────────────────────────────────────
+  US:1.0,CN:1.0,RU:1.0,CA:1.0,BR:1.0,AU:1.0,IN:1.0,
+  DZ:1.0,KZ:1.0,SA:1.0,AR:1.0,MX:1.0,ID:1.0,LY:1.0,
+  IR:1.0,MN:1.0,PE:1.0,CD:1.0,SD:1.0,AO:1.0,ML:1.0,
+  ZA:1.5,CO:1.5,ET:1.5,MZ:1.5,BO:1.5,MG:1.5,TZ:1.5,
+  NG:1.5,VE:1.5,PK:1.5,AF:1.5,SO:1.5,CL:1.5,ZM:1.5,
+  MM:1.5,TD:1.5,CF:1.5,NA:1.5,MR:1.5,EG:1.5,TR:1.5,
+  NE:1.5,UA:1.5,GB:1.5,FR:1.5,DE:1.5,JP:1.5,PH:1.5,
+  SE:1.5,NO:1.5,FI:1.5,PG:1.5,MY:1.5,VN:1.5,TH:1.5,
+  TM:1.5,KE:1.5,UZ:1.5,BY:1.5,KR:1.5,IT:1.5,ES:1.5,
+  PL:1.5,ZW:1.5,CM:1.5,SS:1.5,BF:1.5,MK:1.5,
+  UG:2.5,GH:2.5,RO:2.5,IQ:2.5,MA:2.5,UY:2.5,SY:2.5,
+  KH:2.5,TN:2.5,YE:2.5,PT:2.5,AZ:2.5,GE:2.5,AT:2.5,
+  GR:2.5,BG:2.5,HU:2.5,CZ:2.5,RS:2.5,KG:2.5,TJ:2.5,
+  PY:2.5,NZ:2.5,EC:2.5,CG:2.5,GN:2.5,NP:2.5,BD:2.5,
+  GA:2.5,MW:2.5,ER:2.5,SL:2.5,GY:2.5,SR:2.5,
+  LA:2.5,HN:2.5,GT:2.5,GW:2.5,BJ:2.5,TG:2.5,BI:2.5,
+  RW:2.5,LK:2.5,KW:2.5,OM:2.5,AM:2.5,LR:2.5,NI:2.5,
+  DK:3.5,SK:3.5,FJ:3.5,TL:3.5,CR:3.5,PA:3.5,BT:3.5,
+  SZ:3.5,LS:3.5,GQ:3.5,DJ:3.5,DO:3.5,HT:3.5,JM:3.5,
+  CU:3.5,AE:3.5,JO:3.5,LB:3.5,IL:3.5,PS:3.5,CY:3.5,
+  AL:3.5,BA:3.5,HR:3.5,SI:3.5,BE:3.5,NL:3.5,
+  CH:3.5,IE:3.5,LT:3.5,LV:3.5,EE:3.5,MD:3.5,ME:3.5,
+  BW:3.5,SG:3.5,TW:3.5,HK:3.5,BN:3.5,MV:3.5,
+  BH:3.5,QA:3.5,IS:3.5,CV:3.5,KM:3.5,TT:3.5,
+  LU:5.0,MT:5.0,BZ:5.0,SV:5.0,GM:5.0,
   NYC:6.0,LAX:6.0,LON:6.0,PAR:6.0,BER:6.0,MOW:6.0,PEK:6.0,
   SHA:6.0,TYO:6.0,BOM:6.0,DEL:6.0,KHI:6.0,CGK:6.0,GRU:6.0,
   MEX:6.0,KTM:6.0,HAV:6.0,ISB:6.0,IEV:6.0,TLV:6.0,BKK:6.0,
@@ -78,60 +66,53 @@ const MIN_ZOOM = {
   LHR:6.0,FRA:6.0,CDG:6.0,
 }
 
-const CITY_KEYS = new Set(Object.keys(MIN_ZOOM).filter(k => MIN_ZOOM[k] >= 6.0))
+const CITY_KEYS = new Set(Object.keys(MIN_ZOOM).filter(k=>MIN_ZOOM[k]>=6.0))
 
-// ── 3D tier table (separate from 2D minZoom) ─────────────────────────
-const TIER0_KEYS = new Set(['US','CN','RU','CA','BR','AU','IN','DZ','KZ','SA','AR','MX','ID','LY','IR','MN','PE','CD','SD','AO','ML','ZA'])
-const TIER1_KEYS = new Set([
-  'GB','FR','DE','JP','KR','UA','TR','NG','EG','ET','PK','AF','IQ','MY',
-  'VN','PL','MZ','MG','KE','TZ','BO','CO','CL','VE','ZM','ZW','TH',
-  'MM','SO','CM','NE','BF','TD','NA','GH','UZ','BY','RO','NO','SE','FI',
-  'MR','SS','PY','UG','NP','IT','ES','OM','YE','SY',
-])
-const TIER_MAX_DIST = [Infinity, 2.2, 1.75, 1.35]
-
-function getTier(code) {
-  if (CITY_KEYS.has(code))  return 3
-  if (TIER0_KEYS.has(code)) return 0
-  if (TIER1_KEYS.has(code)) return 1
-  return 2
+// Camera distance at which each size group becomes eligible to show on globe
+// (minDistance from globe surface; globe radius = 1, camera starts at z=2.5)
+function maxDistFor(mz){
+  if(mz<=1.0) return Infinity  // giant  — always
+  if(mz<=1.5) return 2.4       // large
+  if(mz<=2.5) return 1.9       // medium
+  if(mz<=3.5) return 1.58      // small
+  if(mz<=5.0) return 1.40      // tiny
+  return 1.28                   // cities
 }
 
-function ll2v(lat, lng, r = R) {
-  const phi   = (90 - lat)  * (Math.PI / 180)
-  const theta = (lng + 180) * (Math.PI / 180)
+function ll2v(lat,lng,r=R){
+  const phi  =(90-lat)*(Math.PI/180)
+  const theta=(lng+180)*(Math.PI/180)
   return new THREE.Vector3(
-    -r * Math.sin(phi) * Math.cos(theta),
-     r * Math.cos(phi),
-     r * Math.sin(phi) * Math.sin(theta),
+    -r*Math.sin(phi)*Math.cos(theta),
+     r*Math.cos(phi),
+     r*Math.sin(phi)*Math.sin(theta),
   )
 }
 
-function arcPoints(arc) {
-  const src = ll2v(arc.sourceLat, arc.sourceLng)
-  const tgt = ll2v(arc.targetLat, arc.targetLng)
-  const alt = arc.severity === 'critical' ? 0.55 : arc.severity === 'high' ? 0.45 : 0.36
-  const mid = src.clone().add(tgt).normalize().multiplyScalar(R * (1 + alt))
-  return new THREE.QuadraticBezierCurve3(src, mid, tgt).getPoints(SEGMENTS)
+function arcPoints(arc){
+  const src=ll2v(arc.sourceLat,arc.sourceLng)
+  const tgt=ll2v(arc.targetLat,arc.targetLng)
+  const alt=arc.severity==='critical'?0.55:arc.severity==='high'?0.45:0.36
+  const mid=src.clone().add(tgt).normalize().multiplyScalar(R*(1+alt))
+  return new THREE.QuadraticBezierCurve3(src,mid,tgt).getPoints(SEGMENTS)
 }
 
-const SPD3D = [0.003, 0.008, 0.018, 0.042]
-const SPD2D = [0.003, 0.008, 0.018, 0.042]
+const SPD3D=[0.003,0.008,0.018,0.042]
+const SPD2D=[0.003,0.008,0.018,0.042]
 
-// ── Shared topo cache ────────────────────────────────────────────────
-let _topoCache = null
-async function getTopoFeatures() {
-  if (_topoCache) return _topoCache
-  const res   = await fetch(TOPO_URL)
-  const world = await res.json()
-  _topoCache  = topojson.feature(world, world.objects.countries).features
+let _topoCache=null
+async function getTopoFeatures(){
+  if(_topoCache)return _topoCache
+  const res=await fetch(TOPO_URL)
+  const world=await res.json()
+  _topoCache=topojson.feature(world,world.objects.countries).features
   return _topoCache
 }
 
-// ────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────
 // 3D helpers
-// ────────────────────────────────────────────────────────────────────
-function buildStars(scene) {
+// ─────────────────────────────────────────────────────────────────────
+function buildStars(scene){
   const N=8000,pos=new Float32Array(N*3),sz=new Float32Array(N)
   for(let i=0;i<N;i++){
     const t=2*Math.PI*Math.random(),p=Math.acos(2*Math.random()-1),r=14+Math.random()*36
@@ -193,39 +174,69 @@ function buildAtmosphere(scene){
   ))
 }
 
+/**
+ * Build sprites for every country in COUNTRIES.
+ * Returns array sorted by priority (big countries first) so that
+ * the per-frame collision loop always keeps large nations visible.
+ */
 function buildLabels3D(scene){
-  const sprites=[]
+  const items=[]  // {spr, mz}
+
   Object.entries(COUNTRIES).forEach(([code,{name,lat,lng}])=>{
-    const tier=getTier(code)
-    const label=name.toUpperCase()
-    const charW=tier<=1?7:6
-    const W=Math.max(80,label.length*charW+16)
-    const H=tier<=1?20:16
-    const fSize=tier<=1?10:tier===2?8:7
+    const mz=MIN_ZOOM[code]??3.5
+    const isCity=CITY_KEYS.has(code)
+
+    // Canvas / font sizing based on size group
+    const fSize=mz<=1.0?10:mz<=1.5?9:mz<=2.5?8:7
+    const label=name
+    const W=Math.max(70,label.length*fSize*0.62+16)
+    const H=fSize+8
+
     const cv=Object.assign(document.createElement('canvas'),{width:W,height:H})
     const cx=cv.getContext('2d')
     cx.clearRect(0,0,W,H)
     cx.font=`500 ${fSize}px monospace`
     cx.textAlign='center';cx.textBaseline='middle'
-    const col=['rgba(140,255,155,.88)','rgba(90,200,130,.78)','rgba(55,190,175,.70)','rgba(45,168,205,.62)'][tier]
-    cx.shadowColor=tier<=1?'#00ff88':'#00ddbb';cx.shadowBlur=tier<=1?4:2
-    cx.fillStyle=col
-    cx.fillText(tier>=2?`\u00b7 ${label}`:label,W/2,H/2)
-    const spr=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(cv),transparent:true,depthWrite:false}))
-    spr.position.copy(ll2v(lat,lng,R+.06))
-    const sc=[.38,.31,.23,.19][tier]
+
+    // Colour: bright for giant, dimmer for smaller
+    const alpha=mz<=1.0?0.92:mz<=1.5?0.82:mz<=2.5?0.72:0.62
+    cx.fillStyle=isCity
+      ?`rgba(60,185,215,${alpha})`
+      :`rgba(80,215,135,${alpha})`
+    cx.shadowColor='rgba(0,0,0,0.85)'
+    cx.shadowBlur=mz<=1.5?5:3
+    cx.fillText(label,W/2,H/2)
+
+    const spr=new THREE.Sprite(new THREE.SpriteMaterial({
+      map:new THREE.CanvasTexture(cv),
+      transparent:true,depthWrite:false,
+    }))
+    spr.position.copy(ll2v(lat,lng,R+.055))
+
+    // World-space sprite scale: bigger for large countries
+    const sc=mz<=1.0?0.36:mz<=1.5?0.30:mz<=2.5?0.22:0.17
     spr.scale.set(sc,sc*(H/W),1)
-    spr.userData={maxDist:TIER_MAX_DIST[tier]}
-    spr.visible=tier===0
+
+    // maxDist = camera distance at which this sprite becomes eligible
+    spr.userData={
+      mz,
+      maxDist:maxDistFor(mz),
+      // screen-space half-extents in NDC (updated each frame)
+      ndcHW:0, ndcHH:0,
+    }
+    spr.visible=false
     scene.add(spr)
-    sprites.push(spr)
+    items.push({spr,mz})
   })
-  return sprites
+
+  // Sort big countries first — they win collision priority
+  items.sort((a,b)=>a.mz-b.mz)
+  return items.map(i=>i.spr)
 }
 
-// ════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 // FLAT 2-D MAP
-// ════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 function FlatMapView({filteredArcs,speedLevel}){
   const containerRef    =useRef(null)
   const canvasRef       =useRef(null)
@@ -325,7 +336,6 @@ function FlatMapView({filteredArcs,speedLevel}){
     canvas.addEventListener('touchmove',onMove,{passive:false})
     canvas.addEventListener('touchend',onUp)
 
-    // draws one polygon ring into current path (no beginPath/fill/stroke)
     const ringPath=(ring,wx,wy)=>{
       let first=true
       ring.forEach(([lng,lat])=>{
@@ -335,14 +345,11 @@ function FlatMapView({filteredArcs,speedLevel}){
       ctx.closePath()
     }
 
-    // simple AABB overlap check for label collision
     const overlaps=(boxes,x,y,w,h)=>{
       const pad=3
       for(const b of boxes){
-        if(x-w/2-pad < b.x+b.w/2 &&
-           x+w/2+pad > b.x-b.w/2 &&
-           y-h/2-pad < b.y+b.h/2 &&
-           y+h/2+pad > b.y-b.h/2) return true
+        if(x-w/2-pad<b.x+b.w/2&&x+w/2+pad>b.x-b.w/2&&
+           y-h/2-pad<b.y+b.h/2&&y+h/2+pad>b.y-b.h/2)return true
       }
       return false
     }
@@ -350,110 +357,67 @@ function FlatMapView({filteredArcs,speedLevel}){
     const draw=()=>{
       const{W,H}=dimRef.current
       if(!W||!H){rafRef.current=requestAnimationFrame(draw);return}
-
       const spd=SPD2D[speedRef.current]??SPD2D[1]
       const arcs=filteredArcsRef.current
       const{scale:s,tx,ty}=xfRef.current
-
       const wx=lng=>((lng+180)/360)*W*s+tx
       const wy=lat=>((90-lat)/180)*H*s+ty
-
-      // sync arc states
       const ids=new Set(arcs.map(a=>a.id))
       Object.keys(arcStates.current).forEach(id=>{if(!ids.has(id))delete arcStates.current[id]})
       arcs.forEach(arc=>{if(!arcStates.current[arc.id])arcStates.current[arc.id]={t:0,impacted:false,alpha:1,ringR:0}})
 
-      // ── background ────────────────────────────────────────────────
-      ctx.fillStyle='#030d07'
-      ctx.fillRect(0,0,W,H)
+      ctx.fillStyle='#030d07';ctx.fillRect(0,0,W,H)
 
       if(countriesRef.current){
-        // FILL PASS — one batched path
         ctx.beginPath()
         countriesRef.current.forEach(f=>{
           if(!f.geometry)return
-          if(f.geometry.type==='Polygon')
-            f.geometry.coordinates.forEach(r=>ringPath(r,wx,wy))
-          else if(f.geometry.type==='MultiPolygon')
-            f.geometry.coordinates.forEach(poly=>poly.forEach(r=>ringPath(r,wx,wy)))
+          if(f.geometry.type==='Polygon')f.geometry.coordinates.forEach(r=>ringPath(r,wx,wy))
+          else if(f.geometry.type==='MultiPolygon')f.geometry.coordinates.forEach(poly=>poly.forEach(r=>ringPath(r,wx,wy)))
         })
-        ctx.fillStyle='#0d2016'
-        ctx.fill('evenodd')
-
-        // BORDER PASS — per-feature beginPath so no stray connecting lines
+        ctx.fillStyle='#0d2016';ctx.fill('evenodd')
         ctx.strokeStyle='rgba(50,130,70,0.75)'
         ctx.lineWidth=Math.max(0.25,0.6/s)
         countriesRef.current.forEach(f=>{
           if(!f.geometry)return
           ctx.beginPath()
-          if(f.geometry.type==='Polygon')
-            f.geometry.coordinates.forEach(r=>ringPath(r,wx,wy))
-          else if(f.geometry.type==='MultiPolygon')
-            f.geometry.coordinates.forEach(poly=>poly.forEach(r=>ringPath(r,wx,wy)))
+          if(f.geometry.type==='Polygon')f.geometry.coordinates.forEach(r=>ringPath(r,wx,wy))
+          else if(f.geometry.type==='MultiPolygon')f.geometry.coordinates.forEach(poly=>poly.forEach(r=>ringPath(r,wx,wy)))
           ctx.stroke()
         })
       }
 
-      // ── Country labels ─────────────────────────────────────────────
-      // Sort: largest countries first so they win collision checks
       const entries=Object.entries(COUNTRIES)
-      const sorted=entries.slice().sort((a,b)=>{
-        const mzA=MIN_ZOOM[a[0]]??3.5
-        const mzB=MIN_ZOOM[b[0]]??3.5
-        return mzA-mzB   // smaller minZoom = bigger country = rendered first
-      })
-
-      ctx.textAlign='center'
-      ctx.textBaseline='middle'
-
-      // Collision boxes accumulated this frame
+      const sorted=entries.slice().sort((a,b)=>(MIN_ZOOM[a[0]]??3.5)-(MIN_ZOOM[b[0]]??3.5))
+      ctx.textAlign='center';ctx.textBaseline='middle'
       const boxes=[]
-
       sorted.forEach(([code,{name,lat,lng}])=>{
         const mz=MIN_ZOOM[code]??3.5
-        if(s<mz)return  // not zoomed in enough for this country
-
+        if(s<mz)return
         const px=wx(lng),py=wy(lat)
-        if(px<-100||px>W+100||py<-30||py>H+30)return  // offscreen
-
-        // Font size: smaller base, scales with zoom, capped at 11
+        if(px<-100||px>W+100||py<-30||py>H+30)return
         const base=CITY_KEYS.has(code)?7:8
-        const fs=Math.min(11, base + (s-mz)*0.9)
-        if(fs<6.5)return  // too small to bother
-
+        const fs=Math.min(11,base+(s-mz)*0.9)
+        if(fs<6.5)return
         ctx.font=`500 ${fs.toFixed(1)}px monospace`
-
-        // Measure label width for collision detection
         const metrics=ctx.measureText(name)
-        const lw=metrics.width+4
-        const lh=fs+3
-
-        if(overlaps(boxes,px,py,lw,lh))return  // skip if overlapping
+        const lw=metrics.width+4,lh=fs+3
+        if(overlaps(boxes,px,py,lw,lh))return
         boxes.push({x:px,y:py,w:lw,h:lh})
-
-        // Draw thin dark halo first for legibility
-        ctx.shadowColor='rgba(0,0,0,0.9)'
-        ctx.shadowBlur=4
-        ctx.fillStyle=CITY_KEYS.has(code)
-          ?'rgba(70,185,210,.75)'
-          :'rgba(80,210,130,.82)'
-        ctx.fillText(name,px,py)
-        ctx.shadowBlur=0
+        ctx.shadowColor='rgba(0,0,0,0.9)';ctx.shadowBlur=4
+        ctx.fillStyle=CITY_KEYS.has(code)?'rgba(70,185,210,.75)':'rgba(80,210,130,.82)'
+        ctx.fillText(name,px,py);ctx.shadowBlur=0
       })
 
-      // ── Country dots ───────────────────────────────────────────────
       const dotR=Math.max(0.6,1.2/Math.sqrt(s))
       entries.forEach(([code,{lat,lng}])=>{
         if(CITY_KEYS.has(code)&&s<6)return
         const px=wx(lng),py=wy(lat)
         if(px<0||px>W||py<0||py>H)return
-        ctx.beginPath()
-        ctx.arc(px,py,dotR,0,Math.PI*2)
-        ctx.fillStyle='rgba(0,210,100,0.40)'
-        ctx.fill()
+        ctx.beginPath();ctx.arc(px,py,dotR,0,Math.PI*2)
+        ctx.fillStyle='rgba(0,210,100,0.40)';ctx.fill()
       })
 
-      // ── Missiles ───────────────────────────────────────────────────
       arcs.slice(0,50).forEach(arc=>{
         const st=arcStates.current[arc.id];if(!st||st.alpha<=0)return
         const col=arc.typeColor||'#00ff88'
@@ -461,13 +425,10 @@ function FlatMapView({filteredArcs,speedLevel}){
         const tx2=wx(arc.targetLng),ty2=wy(arc.targetLat)
         const mx=(sx+tx2)/2,my=(sy+ty2)/2-Math.min(H*.12,55)
         const bez=t=>({x:(1-t)**2*sx+2*(1-t)*t*mx+t**2*tx2,y:(1-t)**2*sy+2*(1-t)*t*my+t**2*ty2})
-
         if(!st.impacted){st.t=Math.min(st.t+spd,1);if(st.t>=1)st.impacted=true}
         else{st.ringR+=1.8;st.alpha=Math.max(0,st.alpha-.025)}
-
         ctx.beginPath();ctx.moveTo(sx,sy);ctx.quadraticCurveTo(mx,my,tx2,ty2)
         ctx.strokeStyle=col+'12';ctx.lineWidth=1;ctx.stroke()
-
         if(!st.impacted||st.alpha>.5){
           const COMET=.13,tailT=Math.max(0,st.t-COMET)
           ctx.beginPath();let mv=false
@@ -487,7 +448,6 @@ function FlatMapView({filteredArcs,speedLevel}){
           ctx.lineWidth=1.5;ctx.stroke()
         }
       })
-
       rafRef.current=requestAnimationFrame(draw)
     }
     draw()
@@ -528,9 +488,9 @@ function FlatMapView({filteredArcs,speedLevel}){
   )
 }
 
-// ════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 // 3-D GLOBE
-// ════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 function ThreeGlobe({filteredArcs,isRotating,speedLevel}){
   const mountRef=useRef(null)
   const refs=useRef({})
@@ -560,7 +520,7 @@ function ThreeGlobe({filteredArcs,isRotating,speedLevel}){
     buildStars(scene)
     buildGlobe(scene)
     buildAtmosphere(scene)
-    const labelSprites=buildLabels3D(scene)
+    const labelSprites=buildLabels3D(scene)   // sorted big-first
     buildCountryBorders(scene)
 
     const missilesGrp=new THREE.Group(),trailsGrp=new THREE.Group(),spikesGrp=new THREE.Group()
@@ -572,14 +532,66 @@ function ThreeGlobe({filteredArcs,isRotating,speedLevel}){
     }
     window.addEventListener('resize',onResize)
 
+    // Reusable objects for projection
+    const _ndc    = new THREE.Vector3()
+    const _camDir = new THREE.Vector3()
+
     let rafId
     const animate=()=>{
-      rafId=requestAnimationFrame(animate);controls.update()
+      rafId=requestAnimationFrame(animate)
+      controls.update()
+
       const camDist=camera.position.length()
-      const camDir=camera.position.clone().normalize()
+      camera.position.clone().normalize(_camDir)
+      const rW=renderer.domElement.clientWidth  ||W
+      const rH=renderer.domElement.clientHeight ||H
+
+      // ── Per-frame screen-space collision cull ────────────────────
+      // Accepted boxes in NDC (x: -1..1, y: -1..1)
+      const screenBoxes=[]
+
       labelSprites.forEach(spr=>{
-        spr.visible=camDist<=spr.userData.maxDist&&spr.position.clone().normalize().dot(camDir)>0.08
+        const ud=spr.userData
+
+        // 1. Distance gate
+        if(camDist>ud.maxDist){spr.visible=false;return}
+
+        // 2. Back-face cull (sprite on far side of globe)
+        const sprDir=spr.position.clone().normalize()
+        if(sprDir.dot(camera.position.clone().normalize())<0.12){spr.visible=false;return}
+
+        // 3. Project to NDC
+        _ndc.copy(spr.position)
+        _ndc.project(camera)
+        const nx=_ndc.x, ny=_ndc.y
+
+        // off-screen entirely
+        if(nx<-1.1||nx>1.1||ny<-1.1||ny>1.1){spr.visible=false;return}
+
+        // Half-extents of the sprite in NDC space
+        // spr.scale is world-units; approximate NDC size:
+        // ndcW = scale.x / camDist * (1/tan(fov/2)) * aspect^-1 ... simplified:
+        const halfW=(spr.scale.x/camDist)*(1.8/camera.aspect)
+        const halfH=(spr.scale.y/camDist)*1.8
+
+        // 4. Screen-space collision check (big countries already accepted first)
+        let blocked=false
+        for(const b of screenBoxes){
+          const pad=0.04  // NDC padding between labels
+          if(nx-halfW-pad < b.x+b.hw &&
+             nx+halfW+pad > b.x-b.hw &&
+             ny-halfH-pad < b.y+b.hh &&
+             ny+halfH+pad > b.y-b.hh){
+            blocked=true;break
+          }
+        }
+        if(blocked){spr.visible=false;return}
+
+        screenBoxes.push({x:nx,y:ny,hw:halfW,hh:halfH})
+        spr.visible=true
       })
+
+      // ── Missiles ────────────────────────────────────────────────
       const spd=SPD3D[speedRef.current]??SPD3D[1]
       missilesGrp.children.forEach(m=>{
         const ud=m.userData
@@ -594,8 +606,7 @@ function ThreeGlobe({filteredArcs,isRotating,speedLevel}){
           }
           if(ud.t>=1){
             ud.state='impact'
-            const ns=ud.isCrit?5:3
-            for(let i=0;i<ns;i++){
+            for(let i=0;i<(ud.isCrit?5:3);i++){
               const bPos=ll2v(ud.targetLat+(Math.random()-.5)*.8,ud.targetLng+(Math.random()-.5)*.8,R)
               const spk=new THREE.Line(
                 new THREE.BufferGeometry().setFromPoints([bPos.clone(),bPos.clone()]),
@@ -613,6 +624,7 @@ function ThreeGlobe({filteredArcs,isRotating,speedLevel}){
           if(m.material.opacity<=0)ud.state='done'
         }
       })
+
       spikesGrp.children.forEach(spk=>{
         const ud=spk.userData
         if(ud.delay>0){ud.delay-=1;return}
@@ -625,6 +637,7 @@ function ThreeGlobe({filteredArcs,isRotating,speedLevel}){
         spk.material.opacity=Math.max(0,op)
         if(ud.age>=ud.maxAge)ud.done=true
       })
+
       missilesGrp.children.filter(m=>m.userData.state==='done').forEach(m=>{
         m.geometry.dispose();m.material.dispose()
         if(m.userData.trail){m.userData.trail.geometry.dispose();m.userData.trail.material.dispose();trailsGrp.remove(m.userData.trail)}
@@ -636,6 +649,7 @@ function ThreeGlobe({filteredArcs,isRotating,speedLevel}){
       renderer.render(scene,camera)
     }
     animate()
+
     refs.current={scene,missilesGrp,trailsGrp,spikesGrp,controls,renderer,el}
     return()=>{
       cancelAnimationFrame(rafId);window.removeEventListener('resize',onResize)
@@ -665,9 +679,9 @@ function ThreeGlobe({filteredArcs,isRotating,speedLevel}){
   return <div ref={mountRef} style={{width:'100%',height:'100%'}}/>
 }
 
-// ════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 // EXPORT
-// ════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 export default function GlobeView(){
   const{globeView,heatmapActive,attacks,isRotating,speedLevel,selectedTypes,selectedSeverities}=useStore()
   const[webglOk]=useState(()=>{
