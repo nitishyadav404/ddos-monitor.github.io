@@ -10,6 +10,16 @@
  *   Green-flash fix: alpha:false + setClearColor + scene.background
  *   so the WebGL canvas is never transparent.
  *
+ * 2D MAP FIX (land/sea inversion + horizontal lines):
+ *   Root cause: all countries were traced into a SINGLE beginPath() then
+ *   filled with evenodd. Polygons that span the antimeridian (Russia,
+ *   Canada, Alaska, Fiji …) create self-intersecting mega-paths where
+ *   evenodd alternates fill/no-fill across the whole screen — producing
+ *   the bright horizontal bands.
+ *   Fix: each country (and each ring of a MultiPolygon) gets its OWN
+ *   beginPath() / fill('nonzero') call. nonzero is always correct for
+ *   geographic rings. Borders are still stroked per-feature.
+ *
  * LAYER ORDER (back → front):
  *   Stars          — renderOrder 0
  *   Globe mesh     — renderOrder 1  (FrontSide, writes depth)
@@ -301,7 +311,12 @@ function buildLabels3D(scene) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// FLAT 2-D MAP
+// FLAT 2-D MAP — canvas-based Mercator projection
+//
+// KEY FIX: each country polygon is drawn in its own beginPath()/fill()
+// using the 'nonzero' winding rule. The old single-path 'evenodd'
+// approach caused antimeridian-crossing polygons (Russia, USA/Alaska,
+// Canada, Fiji…) to produce screen-wide horizontal fill inversions.
 // ═══════════════════════════════════════════════════════════════════════
 function FlatMapView({ filteredArcs, speedLevel, visible }) {
   const containerRef    = useRef(null)
@@ -418,14 +433,42 @@ function FlatMapView({ filteredArcs, speedLevel, visible }) {
     canvas.addEventListener('touchmove',  onMove,  { passive: false })
     canvas.addEventListener('touchend',   onUp)
 
-    const ringPath = (ring, wx, wy) => {
-      let first = true
+    // ───────────────────────────────────────────────────────────────────────
+    // tracePoly: trace a GeoJSON polygon (array of rings) onto ctx.
+    // First ring = outer boundary, subsequent rings = holes.
+    // Returns immediately without filling or stroking — caller decides.
+    // ───────────────────────────────────────────────────────────────────────
+    const traceRing = (ring, wx, wy) => {
+      if (ring.length < 2) return
+      // Detect antimeridian crossing: if a segment jumps >180 degrees
+      // in longitude, it wraps around the antimeridian. We split it by
+      // NOT connecting those vertices — this prevents the horizontal streak.
+      let prevLng = null
       ring.forEach(([lng, lat]) => {
         const px = wx(lng), py = wy(lat)
-        if (first) { ctx.moveTo(px, py); first = false } else ctx.lineTo(px, py)
+        if (prevLng !== null && Math.abs(lng - prevLng) > 180) {
+          // antimeridian wrap — lift pen instead of drawing across the globe
+          ctx.moveTo(px, py)
+        } else if (prevLng === null) {
+          ctx.moveTo(px, py)
+        } else {
+          ctx.lineTo(px, py)
+        }
+        prevLng = lng
       })
-      ctx.closePath()
+      // Close the ring back to start (but only if no antimeridian was crossed
+      // in the closing segment)
+      const [lngEnd] = ring[ring.length - 1]
+      const [lngStart] = ring[0]
+      if (Math.abs(lngEnd - lngStart) <= 180) {
+        ctx.closePath()
+      }
     }
+
+    const tracePoly = (rings, wx, wy) => {
+      rings.forEach(ring => traceRing(ring, wx, wy))
+    }
+
     const overlaps = (boxes, x, y, w, h) => {
       const pad = 3
       for (const b of boxes) {
@@ -443,29 +486,53 @@ function FlatMapView({ filteredArcs, speedLevel, visible }) {
       const { scale: s, tx, ty } = xfRef.current
       const wx = lng => ((lng + 180) / 360) * W * s + tx
       const wy = lat => ((90  - lat) / 180) * H * s + ty
+
+      // Track arc states
       const ids = new Set(arcs.map(a => a.id))
       Object.keys(arcStates.current).forEach(id => { if (!ids.has(id)) delete arcStates.current[id] })
       arcs.forEach(arc => { if (!arcStates.current[arc.id]) arcStates.current[arc.id] = { t: 0, impacted: false, alpha: 1, ringR: 0 } })
+
+      // ── Background (ocean) ───────────────────────────────────────────────────────────
       ctx.fillStyle = '#030d07'
       ctx.fillRect(0, 0, W, H)
+
       if (countriesRef.current) {
-        ctx.beginPath()
-        countriesRef.current.forEach(f => {
-          if (!f.geometry) return
-          if (f.geometry.type === 'Polygon')           f.geometry.coordinates.forEach(r => ringPath(r, wx, wy))
-          else if (f.geometry.type === 'MultiPolygon') f.geometry.coordinates.forEach(poly => poly.forEach(r => ringPath(r, wx, wy)))
-        })
-        ctx.fillStyle = '#0d2016'; ctx.fill('evenodd')
+        ctx.fillStyle   = '#0d2016'  // land color
         ctx.strokeStyle = 'rgba(50,130,70,0.75)'
         ctx.lineWidth   = Math.max(0.25, 0.6 / s)
+
         countriesRef.current.forEach(f => {
           if (!f.geometry) return
-          ctx.beginPath()
-          if (f.geometry.type === 'Polygon')           f.geometry.coordinates.forEach(r => ringPath(r, wx, wy))
-          else if (f.geometry.type === 'MultiPolygon') f.geometry.coordinates.forEach(poly => poly.forEach(r => ringPath(r, wx, wy)))
-          ctx.stroke()
+
+          if (f.geometry.type === 'Polygon') {
+            // ── FILL each polygon separately with nonzero ──
+            ctx.beginPath()
+            tracePoly(f.geometry.coordinates, wx, wy)
+            ctx.fill()    // default = 'nonzero' — always correct for geographic data
+
+            // ── STROKE borders ──
+            ctx.beginPath()
+            tracePoly(f.geometry.coordinates, wx, wy)
+            ctx.stroke()
+
+          } else if (f.geometry.type === 'MultiPolygon') {
+            // Each polygon in the MultiPolygon is drawn independently.
+            // This is critical: combining them into one path would re-introduce
+            // the evenodd inversion for countries like Russia and Indonesia.
+            f.geometry.coordinates.forEach(poly => {
+              ctx.beginPath()
+              tracePoly(poly, wx, wy)
+              ctx.fill()
+
+              ctx.beginPath()
+              tracePoly(poly, wx, wy)
+              ctx.stroke()
+            })
+          }
         })
       }
+
+      // ── Country name labels ──────────────────────────────────────────────────────
       const entries = Object.entries(COUNTRIES)
       const sorted  = entries.slice().sort((a, b) => (MIN_ZOOM[a[0]] ?? 3.5) - (MIN_ZOOM[b[0]] ?? 3.5))
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
@@ -487,6 +554,8 @@ function FlatMapView({ filteredArcs, speedLevel, visible }) {
         ctx.fillStyle   = CITY_KEYS.has(code) ? 'rgba(70,185,210,.75)' : 'rgba(80,210,130,.82)'
         ctx.fillText(name, px, py); ctx.shadowBlur = 0
       })
+
+      // ── Country dots ─────────────────────────────────────────────────────────────
       const dotR = Math.max(0.6, 1.2 / Math.sqrt(s))
       entries.forEach(([code, { lat, lng }]) => {
         if (CITY_KEYS.has(code) && s < 6) return
@@ -495,6 +564,8 @@ function FlatMapView({ filteredArcs, speedLevel, visible }) {
         ctx.beginPath(); ctx.arc(px, py, dotR, 0, Math.PI*2)
         ctx.fillStyle = 'rgba(0,210,100,0.40)'; ctx.fill()
       })
+
+      // ── Attack arcs ─────────────────────────────────────────────────────────────
       arcs.slice(0, 50).forEach(arc => {
         const st = arcStates.current[arc.id]; if (!st || st.alpha <= 0) return
         const col = arc.typeColor || '#00ff88'
@@ -522,6 +593,7 @@ function FlatMapView({ filteredArcs, speedLevel, visible }) {
           ctx.lineWidth=1.5;ctx.stroke()
         }
       })
+
       rafRef.current = requestAnimationFrame(draw)
     }
     draw()
@@ -548,7 +620,6 @@ function FlatMapView({ filteredArcs, speedLevel, visible }) {
       className="globe-container"
       style={{
         position: 'absolute', inset: 0, overflow: 'hidden',
-        // Visibility toggle: stays mounted, just hidden behind 3D globe
         opacity:        visible ? 1 : 0,
         pointerEvents:  visible ? 'auto' : 'none',
         transition:     'opacity 0.25s ease',
@@ -763,7 +834,6 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel, visible }) {
       className="globe-container"
       style={{
         position: 'absolute', inset: 0,
-        // Visibility toggle: stays mounted, just hidden behind flat map
         opacity:       visible ? 1 : 0,
         pointerEvents: visible ? 'auto' : 'none',
         transition:    'opacity 0.25s ease',
