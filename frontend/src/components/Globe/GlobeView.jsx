@@ -10,23 +10,29 @@
  *   Green-flash fix: alpha:false + setClearColor + scene.background
  *   so the WebGL canvas is never transparent.
  *
+ * ATMOSPHERE (Kaspersky Fresnel glow):
+ *   4-shell Fresnel stack rendered on BackSide spheres with AdditiveBlending:
+ *   1. Inner rim  — r=1.08, tight pow(rim,4) falloff, Kaspersky teal #00A88E
+ *   2. Corona     — r=1.20, pow(rim,3.5) wider halo, same teal
+ *   3. Outer halo — r=1.55, pow(rim,2.5) very soft bleed into space
+ *   4. Deep halo  — r=2.20, pow(rim,1.8) faint galaxy-edge glow
+ *   Each shell's vertex shader passes the view-space normal (vNormal) so the
+ *   fragment shader can compute dot(normalize(vNormal), vec3(0,0,1)) which is
+ *   the classic Fresnel/rim formula — giving exactly 0 opacity at the center
+ *   and max opacity at the limb.
+ *   Animated mist (FrontSide) rides on top for the cloud-wisp look.
+ *
  * 2D MAP FIX (land/sea inversion + horizontal lines):
- *   Root cause: all countries were traced into a SINGLE beginPath() then
- *   filled with evenodd. Polygons that span the antimeridian (Russia,
- *   Canada, Alaska, Fiji …) create self-intersecting mega-paths where
- *   evenodd alternates fill/no-fill across the whole screen — producing
- *   the bright horizontal bands.
- *   Fix: each country (and each ring of a MultiPolygon) gets its OWN
- *   beginPath() / fill('nonzero') call. nonzero is always correct for
- *   geographic rings. Borders are still stroked per-feature.
+ *   Each country polygon gets its OWN beginPath()/fill('nonzero') call.
+ *   Antimeridian crossings (lng jump >180) lift the pen with moveTo().
  *
  * LAYER ORDER (back → front):
- *   Stars          — renderOrder 0
- *   Globe mesh     — renderOrder 1  (FrontSide, writes depth)
- *   Atmosphere     — renderOrder 2  (BackSide sphere, depth-tested)
- *   Country lines  — renderOrder 3
- *   Mist           — renderOrder 3
- *   Missiles/arcs  — renderOrder 4+
+ *   Stars        — renderOrder 0
+ *   Globe mesh   — renderOrder 1
+ *   Fresnel halos — renderOrder 2  (BackSide, AdditiveBlending)
+ *   Mist         — renderOrder 3  (FrontSide, AdditiveBlending)
+ *   Borders      — renderOrder 4
+ *   Missiles/arcs — renderOrder 5+
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
@@ -137,68 +143,120 @@ function buildStars(scene) {
   scene.add(pts)
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// buildAtmosphere — Kaspersky-style Fresnel rim-light glow
+//
+// The Fresnel formula: intensity = pow(1.0 - dot(vNormal, vec3(0,0,1)), power)
+//   vNormal is the view-space normal (from normalMatrix * normal).
+//   When the surface faces the camera (center of globe), dot ≈ 1 → intensity ≈ 0
+//   When the surface is edge-on (limb of globe),     dot ≈ 0 → intensity ≈ 1
+//
+// We use THREE.BackSide so the sphere renders its inner face — meaning
+// the normals point toward the camera at the limb, giving us the rim glow
+// without occluding the globe itself.
+//
+// 4 shells stacked with AdditiveBlending:
+//   Shell A r=1.08  power=5.0  strength=0.72  → tight Kaspersky teal rim
+//   Shell B r=1.20  power=3.5  strength=0.45  → wider soft corona
+//   Shell C r=1.55  power=2.5  strength=0.22  → outer atmosphere bleed
+//   Shell D r=2.20  power=1.8  strength=0.08  → deep-space haze
+// ═══════════════════════════════════════════════════════════════════════
+
+// Shared Fresnel vertex shader — passes the VIEW-SPACE normal to the fragment.
+// Critical: we use normalMatrix (inverse-transpose of modelViewMatrix) so the
+// normal is correctly transformed even when the sphere is scaled non-uniformly.
+const FRESNEL_VERT = /* glsl */`
+  varying vec3 vNormal;
+  varying vec3 vViewPos;
+  void main() {
+    // View-space normal — used for Fresnel dot product
+    vNormal  = normalize(normalMatrix * normal);
+    vec4 mv  = modelViewMatrix * vec4(position, 1.0);
+    vViewPos = mv.xyz;
+    gl_Position = projectionMatrix * mv;
+  }
+`
+
+// Fresnel fragment shader.
+// dot(vNormal, vec3(0,0,1)) is the cosine of the angle between the
+// surface normal and the camera look direction in view space.
+// pow(clamp(1.0 - that_dot, 0.0, 1.0), power) peaks at the limb.
+const makeFresnel = (r, g, b, power, strength) => new THREE.ShaderMaterial({
+  uniforms: {
+    uColor:    { value: new THREE.Color(r, g, b) },
+    uPower:    { value: power },
+    uStrength: { value: strength },
+  },
+  vertexShader: FRESNEL_VERT,
+  fragmentShader: /* glsl */`
+    uniform vec3  uColor;
+    uniform float uPower;
+    uniform float uStrength;
+    varying vec3  vNormal;
+    varying vec3  vViewPos;
+    void main() {
+      // View direction in view space is always (0,0,1) toward camera
+      float cosA      = dot(normalize(vNormal), vec3(0.0, 0.0, 1.0));
+      float rim       = clamp(1.0 - cosA, 0.0, 1.0);
+      float intensity = pow(rim, uPower) * uStrength;
+      gl_FragColor    = vec4(uColor * intensity, intensity);
+    }
+  `,
+  side:        THREE.BackSide,
+  blending:    THREE.AdditiveBlending,
+  transparent: true,
+  depthWrite:  false,
+  depthTest:   true,
+})
+
 function buildAtmosphere(scene) {
-  // Shell 1: Main corona
-  const coronaMat = new THREE.ShaderMaterial({
-    vertexShader: `
-      varying vec3 vWorld;
-      void main() {
-        vWorld = (modelMatrix * vec4(position, 1.0)).xyz;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }
-    `,
-    fragmentShader: `
-      varying vec3 vWorld;
-      void main() {
-        float from_edge = length(vWorld) - 1.0;
-        float alpha = exp(-max(from_edge, 0.0) * 0.7) * 0.08;
-        vec3  color = vec3(0.0, 1.0, 0.38);
-        gl_FragColor = vec4(color, clamp(alpha, 0.0, 0.15));
-      }
-    `,
-    side:        THREE.BackSide,
-    blending:    THREE.AdditiveBlending,
-    transparent: true,
-    depthWrite:  false,
-    depthTest:   true,
-  })
-  const coronaMesh = new THREE.Mesh(new THREE.SphereGeometry(1.5, 96, 96), coronaMat)
-  coronaMesh.renderOrder = 2
-  scene.add(coronaMesh)
+  // Kaspersky teal: #00A88E = rgb(0, 168, 142) → normalized (0, 0.659, 0.557)
+  // We use a slightly brighter teal to work well with additive blending
+  const KR = 0.00, KG = 0.72, KB = 0.58   // #00B894 — Kaspersky teal
+  const OR = 0.00, OG = 0.55, OB = 0.38   // outer halos lean green
 
-  // Shell 2: Wide space halo
-  const haloMat = new THREE.ShaderMaterial({
-    vertexShader: `
-      varying vec3 vWorld;
-      void main() {
-        vWorld = (modelMatrix * vec4(position, 1.0)).xyz;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }
-    `,
-    fragmentShader: `
-      varying vec3 vWorld;
-      void main() {
-        float from_edge = length(vWorld) - 1.0;
-        float alpha = exp(-max(from_edge, 0.0) * 0.5) * 0.04;
-        vec3  color = vec3(0.0, 0.85, 0.30);
-        gl_FragColor = vec4(color, clamp(alpha, 0.0, 0.08));
-      }
-    `,
-    side:        THREE.BackSide,
-    blending:    THREE.AdditiveBlending,
-    transparent: true,
-    depthWrite:  false,
-    depthTest:   true,
-  })
-  const haloMesh = new THREE.Mesh(new THREE.SphereGeometry(2.0, 64, 64), haloMat)
-  haloMesh.renderOrder = 2
-  scene.add(haloMesh)
+  // Shell A: Tight inner rim — most visible part of the Kaspersky glow
+  const shellA = new THREE.Mesh(
+    new THREE.SphereGeometry(1.08, 96, 96),
+    makeFresnel(KR, KG, KB, 5.0, 0.72)
+  )
+  shellA.renderOrder = 2; scene.add(shellA)
 
-  // Shell 3: Animated mist
+  // Shell B: Soft corona — bleeds ~20% beyond the globe edge
+  const shellB = new THREE.Mesh(
+    new THREE.SphereGeometry(1.20, 96, 96),
+    makeFresnel(KR, KG, KB, 3.5, 0.45)
+  )
+  shellB.renderOrder = 2; scene.add(shellB)
+
+  // Shell C: Outer atmosphere — the wide hazy aura
+  const shellC = new THREE.Mesh(
+    new THREE.SphereGeometry(1.55, 64, 64),
+    makeFresnel(OR, OG, OB, 2.5, 0.22)
+  )
+  shellC.renderOrder = 2; scene.add(shellC)
+
+  // Shell D: Deep-space glow — very faint, bleeds into starfield
+  const shellD = new THREE.Mesh(
+    new THREE.SphereGeometry(2.20, 48, 48),
+    makeFresnel(OR, OG * 0.7, OB * 0.5, 1.8, 0.07)
+  )
+  shellD.renderOrder = 2; scene.add(shellD)
+
+  // Animated mist — FrontSide, uses the same Fresnel rim to concentrate
+  // the wispy cloud effect at the limb of the globe, matching Kaspersky's
+  // evaporating-mist look
   const makeMistMat = (seed, amount) => new THREE.ShaderMaterial({
-    uniforms: { uTime: { value: 0 }, uSeed: { value: seed }, uAmt: { value: amount } },
-    vertexShader: `
-      varying vec3 vWorld; varying vec3 vNormal; varying vec3 vViewPos;
+    uniforms: {
+      uTime:  { value: 0 },
+      uSeed:  { value: seed },
+      uAmt:   { value: amount },
+      uColor: { value: new THREE.Color(KR, KG, KB) },
+    },
+    vertexShader: /* glsl */`
+      varying vec3 vWorld;
+      varying vec3 vNormal;
+      varying vec3 vViewPos;
       void main() {
         vNormal  = normalize(normalMatrix * normal);
         vec4 mv  = modelViewMatrix * vec4(position, 1.0);
@@ -207,9 +265,15 @@ function buildAtmosphere(scene) {
         gl_Position = projectionMatrix * mv;
       }
     `,
-    fragmentShader: `
-      uniform float uTime; uniform float uSeed; uniform float uAmt;
-      varying vec3 vWorld; varying vec3 vNormal; varying vec3 vViewPos;
+    fragmentShader: /* glsl */`
+      uniform float uTime;
+      uniform float uSeed;
+      uniform float uAmt;
+      uniform vec3  uColor;
+      varying vec3  vWorld;
+      varying vec3  vNormal;
+      varying vec3  vViewPos;
+
       float hash(vec3 p) {
         p = fract(p * 0.3183099 + uSeed); p *= 17.0;
         return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
@@ -220,21 +284,29 @@ function buildAtmosphere(scene) {
         return n;
       }
       void main() {
-        vec3  viewDir = normalize(-vViewPos);
-        float rim  = 1.0 - abs(dot(viewDir, normalize(vNormal)));
-        float base = pow(rim, 0.9);
-        vec3  p = normalize(vWorld) * 2.5;
+        // Fresnel rim factor — same formula as the halo shells
+        float cosA = dot(normalize(vNormal), vec3(0.0, 0.0, 1.0));
+        float rim  = clamp(1.0 - cosA, 0.0, 1.0);
+        float base = pow(rim, 1.2);   // concentrate mist at the limb
+
+        // Animated noise for wispy look
+        vec3 p = normalize(vWorld) * 2.5;
         p += vec3(uTime*0.04, uTime*0.025, -uTime*0.035);
-        float fog = smoothstep(0.38, 0.90, noise(p)) * base;
-        gl_FragColor = vec4(0.0, 0.65, 0.22, clamp(fog * uAmt, 0.0, 0.08));
+        float fog = smoothstep(0.35, 0.88, noise(p)) * base;
+
+        float alpha = clamp(fog * uAmt, 0.0, 0.10);
+        gl_FragColor = vec4(uColor * alpha, alpha);
       }
     `,
-    transparent: true, blending: THREE.AdditiveBlending,
-    depthWrite: false, depthTest: true, side: THREE.FrontSide,
+    transparent: true,
+    blending:    THREE.AdditiveBlending,
+    depthWrite:  false,
+    depthTest:   true,
+    side:        THREE.FrontSide,
   })
 
-  const mist1 = new THREE.Mesh(new THREE.SphereGeometry(1.12, 96, 96), makeMistMat(1.3, 0.07))
-  const mist2 = new THREE.Mesh(new THREE.SphereGeometry(1.38, 96, 96), makeMistMat(7.7, 0.05))
+  const mist1 = new THREE.Mesh(new THREE.SphereGeometry(1.12, 96, 96), makeMistMat(1.3,  0.08))
+  const mist2 = new THREE.Mesh(new THREE.SphereGeometry(1.38, 96, 96), makeMistMat(7.7,  0.055))
   mist1.renderOrder = 3
   mist2.renderOrder = 3
   scene.add(mist1, mist2)
@@ -335,7 +407,6 @@ function FlatMapView({ filteredArcs, speedLevel, visible }) {
   useEffect(() => { filteredArcsRef.current = filteredArcs }, [filteredArcs])
   useEffect(() => { getTopoFeatures().then(f => { countriesRef.current = f }).catch(console.warn) }, [])
 
-  // Trigger resize when visibility changes so canvas dimensions are correct
   useEffect(() => {
     if (visible && containerRef.current) {
       const r  = containerRef.current.getBoundingClientRect()
@@ -433,21 +504,12 @@ function FlatMapView({ filteredArcs, speedLevel, visible }) {
     canvas.addEventListener('touchmove',  onMove,  { passive: false })
     canvas.addEventListener('touchend',   onUp)
 
-    // ───────────────────────────────────────────────────────────────────────
-    // tracePoly: trace a GeoJSON polygon (array of rings) onto ctx.
-    // First ring = outer boundary, subsequent rings = holes.
-    // Returns immediately without filling or stroking — caller decides.
-    // ───────────────────────────────────────────────────────────────────────
     const traceRing = (ring, wx, wy) => {
       if (ring.length < 2) return
-      // Detect antimeridian crossing: if a segment jumps >180 degrees
-      // in longitude, it wraps around the antimeridian. We split it by
-      // NOT connecting those vertices — this prevents the horizontal streak.
       let prevLng = null
       ring.forEach(([lng, lat]) => {
         const px = wx(lng), py = wy(lat)
         if (prevLng !== null && Math.abs(lng - prevLng) > 180) {
-          // antimeridian wrap — lift pen instead of drawing across the globe
           ctx.moveTo(px, py)
         } else if (prevLng === null) {
           ctx.moveTo(px, py)
@@ -456,18 +518,12 @@ function FlatMapView({ filteredArcs, speedLevel, visible }) {
         }
         prevLng = lng
       })
-      // Close the ring back to start (but only if no antimeridian was crossed
-      // in the closing segment)
-      const [lngEnd] = ring[ring.length - 1]
+      const [lngEnd]   = ring[ring.length - 1]
       const [lngStart] = ring[0]
-      if (Math.abs(lngEnd - lngStart) <= 180) {
-        ctx.closePath()
-      }
+      if (Math.abs(lngEnd - lngStart) <= 180) ctx.closePath()
     }
 
-    const tracePoly = (rings, wx, wy) => {
-      rings.forEach(ring => traceRing(ring, wx, wy))
-    }
+    const tracePoly = (rings, wx, wy) => rings.forEach(ring => traceRing(ring, wx, wy))
 
     const overlaps = (boxes, x, y, w, h) => {
       const pad = 3
@@ -487,52 +543,32 @@ function FlatMapView({ filteredArcs, speedLevel, visible }) {
       const wx = lng => ((lng + 180) / 360) * W * s + tx
       const wy = lat => ((90  - lat) / 180) * H * s + ty
 
-      // Track arc states
       const ids = new Set(arcs.map(a => a.id))
       Object.keys(arcStates.current).forEach(id => { if (!ids.has(id)) delete arcStates.current[id] })
       arcs.forEach(arc => { if (!arcStates.current[arc.id]) arcStates.current[arc.id] = { t: 0, impacted: false, alpha: 1, ringR: 0 } })
 
-      // ── Background (ocean) ───────────────────────────────────────────────────────────
       ctx.fillStyle = '#030d07'
       ctx.fillRect(0, 0, W, H)
 
       if (countriesRef.current) {
-        ctx.fillStyle   = '#0d2016'  // land color
+        ctx.fillStyle   = '#0d2016'
         ctx.strokeStyle = 'rgba(50,130,70,0.75)'
         ctx.lineWidth   = Math.max(0.25, 0.6 / s)
 
         countriesRef.current.forEach(f => {
           if (!f.geometry) return
-
           if (f.geometry.type === 'Polygon') {
-            // ── FILL each polygon separately with nonzero ──
-            ctx.beginPath()
-            tracePoly(f.geometry.coordinates, wx, wy)
-            ctx.fill()    // default = 'nonzero' — always correct for geographic data
-
-            // ── STROKE borders ──
-            ctx.beginPath()
-            tracePoly(f.geometry.coordinates, wx, wy)
-            ctx.stroke()
-
+            ctx.beginPath(); tracePoly(f.geometry.coordinates, wx, wy); ctx.fill()
+            ctx.beginPath(); tracePoly(f.geometry.coordinates, wx, wy); ctx.stroke()
           } else if (f.geometry.type === 'MultiPolygon') {
-            // Each polygon in the MultiPolygon is drawn independently.
-            // This is critical: combining them into one path would re-introduce
-            // the evenodd inversion for countries like Russia and Indonesia.
             f.geometry.coordinates.forEach(poly => {
-              ctx.beginPath()
-              tracePoly(poly, wx, wy)
-              ctx.fill()
-
-              ctx.beginPath()
-              tracePoly(poly, wx, wy)
-              ctx.stroke()
+              ctx.beginPath(); tracePoly(poly, wx, wy); ctx.fill()
+              ctx.beginPath(); tracePoly(poly, wx, wy); ctx.stroke()
             })
           }
         })
       }
 
-      // ── Country name labels ──────────────────────────────────────────────────────
       const entries = Object.entries(COUNTRIES)
       const sorted  = entries.slice().sort((a, b) => (MIN_ZOOM[a[0]] ?? 3.5) - (MIN_ZOOM[b[0]] ?? 3.5))
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
@@ -555,7 +591,6 @@ function FlatMapView({ filteredArcs, speedLevel, visible }) {
         ctx.fillText(name, px, py); ctx.shadowBlur = 0
       })
 
-      // ── Country dots ─────────────────────────────────────────────────────────────
       const dotR = Math.max(0.6, 1.2 / Math.sqrt(s))
       entries.forEach(([code, { lat, lng }]) => {
         if (CITY_KEYS.has(code) && s < 6) return
@@ -565,7 +600,6 @@ function FlatMapView({ filteredArcs, speedLevel, visible }) {
         ctx.fillStyle = 'rgba(0,210,100,0.40)'; ctx.fill()
       })
 
-      // ── Attack arcs ─────────────────────────────────────────────────────────────
       arcs.slice(0, 50).forEach(arc => {
         const st = arcStates.current[arc.id]; if (!st || st.alpha <= 0) return
         const col = arc.typeColor || '#00ff88'
@@ -593,7 +627,6 @@ function FlatMapView({ filteredArcs, speedLevel, visible }) {
           ctx.lineWidth=1.5;ctx.stroke()
         }
       })
-
       rafRef.current = requestAnimationFrame(draw)
     }
     draw()
@@ -656,7 +689,6 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel, visible }) {
 
   useEffect(() => { speedRef.current = speedLevel }, [speedLevel])
 
-  // Pause/resume RAF when hidden to save GPU
   const pausedRef = useRef(false)
   useEffect(() => { pausedRef.current = !visible }, [visible])
 
@@ -664,15 +696,14 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel, visible }) {
     const el = mountRef.current; if (!el) return
     const W = el.clientWidth || 800, H = el.clientHeight || 600
 
-    // alpha:false + setClearColor = opaque canvas, no green bleed-through
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false })
-    renderer.setClearColor(0x030a05, 1)   // matches --c-bg
+    renderer.setClearColor(0x030a05, 1)
     renderer.setSize(W, H)
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     el.appendChild(renderer.domElement)
 
     const scene  = new THREE.Scene()
-    scene.background = new THREE.Color(0x030a05) // belt-and-suspenders
+    scene.background = new THREE.Color(0x030a05)
 
     const camera = new THREE.PerspectiveCamera(45, W/H, .1, 100)
     camera.position.z = 2.5
@@ -724,7 +755,6 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel, visible }) {
     let rafId
     const animate = () => {
       rafId = requestAnimationFrame(animate)
-      // Skip heavy work when hidden, but keep RAF alive so no re-init needed
       if (pausedRef.current) return
       controls.update()
 
@@ -860,8 +890,6 @@ export default function GlobeView() {
 
   return (
     <div style={{ position:'relative', width:'100%', height:'100%', background:'#030a05', overflow:'hidden' }}>
-
-      {/* 3D Globe — always mounted when WebGL available, shown/hidden via opacity */}
       {webglOk && (
         <ThreeGlobe
           filteredArcs={filteredArcs}
@@ -870,19 +898,14 @@ export default function GlobeView() {
           visible={show3d}
         />
       )}
-
-      {/* Flat Map — always mounted, shown/hidden via opacity */}
       <FlatMapView
         filteredArcs={filteredArcs}
         speedLevel={speedLevel}
         visible={showFlat}
       />
-
-      {/* Heatmap overlay — only on 3D */}
       {heatmapActive && show3d && (
         <div className="absolute inset-0 pointer-events-none" style={{ background:'radial-gradient(ellipse at 35% 45%,rgba(0,60,200,.05) 0%,transparent 55%),radial-gradient(ellipse at 65% 55%,rgba(100,0,200,.04) 0%,transparent 50%)', zIndex:3 }} />
       )}
-
       {!webglOk && (
         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-yellow-500/20 border border-yellow-500/40 text-yellow-300 text-xs px-3 py-1.5 rounded-lg" style={{ zIndex:10 }}>
           WebGL unavailable
