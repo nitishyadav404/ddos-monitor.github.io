@@ -2,10 +2,10 @@
  * GlobeView.jsx
  *
  * 3D Globe label fix:
- *   - Per-frame screen-space AABB collision detection for sprites.
- *     Each frame, every visible sprite is projected to NDC coords;
+ *   - Per-frame screen-space AABB collision detection for s.
+ *     Each frame, every visible  is projected to NDC coords;
  *     if its screen box overlaps a higher-priority (bigger country)
- *     already-accepted sprite it is hidden for that frame.
+ *     already-accepted  it is hidden for that frame.
  *   - maxDist thresholds tightened per size group using MIN_ZOOM:
  *       giant   → always (Infinity)
  *       large   → 2.4
@@ -13,7 +13,7 @@
  *       small   → 1.55
  *       tiny    → 1.38
  *       cities  → 1.28
- *   - Sprites sorted by priority (big country first) so large nations
+ *   - s sorted by priority (big country first) so large nations
  *     always win the collision check against small neighbours.
  *   - Thinner 500-weight font, smaller canvas, no bold globs.
  *
@@ -175,7 +175,7 @@ function buildAtmosphere(scene){
 }
 
 /**
- * Build sprites for every country in COUNTRIES.
+ * Build s for every country in COUNTRIES.
  * Returns array sorted by priority (big countries first) so that
  * the per-frame collision loop always keeps large nations visible.
  */
@@ -207,13 +207,15 @@ function buildLabels3D(scene){
     cx.shadowBlur=mz<=1.5?5:3
     cx.fillText(label,W/2,H/2)
 
-    const spr=new THREE.Sprite(new THREE.SpriteMaterial({
+    const spr=new THREE.(new THREE.Material({
       map:new THREE.CanvasTexture(cv),
       transparent:true,depthWrite:false,
     }))
-    spr.position.copy(ll2v(lat,lng,R+.055))
+    // Smaller altitude so the name “sticks” close to the surface 
+    const alt = isCity ? 0.012 : 0.015
+    spr.position.copy(ll2v(lat, lng, R + alt))
 
-    // World-space sprite scale: bigger for large countries
+    // World-space  scale: bigger for large countries
     const sc=mz<=1.0?0.36:mz<=1.5?0.30:mz<=2.5?0.22:0.17
     spr.scale.set(sc,sc*(H/W),1)
 
@@ -520,7 +522,7 @@ function ThreeGlobe({filteredArcs,isRotating,speedLevel}){
     buildStars(scene)
     buildGlobe(scene)
     buildAtmosphere(scene)
-    const labelSprites=buildLabels3D(scene)   // sorted big-first
+    const labels=buildLabels3D(scene)   // sorted big-first
     buildCountryBorders(scene)
 
     const missilesGrp=new THREE.Group(),trailsGrp=new THREE.Group(),spikesGrp=new THREE.Group()
@@ -550,13 +552,13 @@ function ThreeGlobe({filteredArcs,isRotating,speedLevel}){
       // Accepted boxes in NDC (x: -1..1, y: -1..1)
       const screenBoxes=[]
 
-      labelSprites.forEach(spr=>{
+      labels.forEach(spr=>{
         const ud=spr.userData
 
         // 1. Distance gate
         if(camDist>ud.maxDist){spr.visible=false;return}
 
-        // 2. Back-face cull (sprite on far side of globe)
+        // 2. Back-face cull ( on far side of globe)
         const sprDir=spr.position.clone().normalize()
         if(sprDir.dot(camera.position.clone().normalize())<0.12){spr.visible=false;return}
 
@@ -568,7 +570,7 @@ function ThreeGlobe({filteredArcs,isRotating,speedLevel}){
         // off-screen entirely
         if(nx<-1.1||nx>1.1||ny<-1.1||ny>1.1){spr.visible=false;return}
 
-        // Half-extents of the sprite in NDC space
+        // Half-extents of the  in NDC space
         // spr.scale is world-units; approximate NDC size:
         // ndcW = scale.x / camDist * (1/tan(fov/2)) * aspect^-1 ... simplified:
         const halfW=(spr.scale.x/camDist)*(1.8/camera.aspect)
