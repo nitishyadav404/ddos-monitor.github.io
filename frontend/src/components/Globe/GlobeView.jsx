@@ -162,13 +162,11 @@ function buildAtmosphere(scene) {
 /**
  * buildLabels3D — CSS2DObject approach
  *
- * Places a real HTML <div> at each country's lat/lng position in 3D space.
- * CSS2DRenderer projects the 3D point to screen coordinates each frame,
- * so the label always appears AT that country — upright, readable, never
- * rotated or mirrored. Exactly like Google Maps country labels.
- *
- * Visibility logic: hide when the country is on the back hemisphere
- * (dot product of surface normal vs camera direction < 0.1).
+ * Font size tiers (+4px from previous version):
+ *   Tier 1 (largest countries, mz ≤ 1.0): 15px
+ *   Tier 2 (large countries,   mz ≤ 1.5): 13.5px
+ *   Tier 3 (medium countries,  mz ≤ 2.5): 12px
+ *   Tier 4 (small countries,   mz > 2.5): 11px
  */
 function buildLabels3D(scene) {
   const labelObjects = []
@@ -177,8 +175,8 @@ function buildLabels3D(scene) {
     const mz     = MIN_ZOOM[code] ?? 3.5
     const isCity = CITY_KEYS.has(code)
 
-    // Font size tier
-    const fs = mz <= 1.0 ? 11 : mz <= 1.5 ? 9.5 : mz <= 2.5 ? 8 : 7
+    // Font size tiers — each +4px vs previous version
+    const fs = mz <= 1.0 ? 15 : mz <= 1.5 ? 13.5 : mz <= 2.5 ? 12 : 11
 
     const div = document.createElement('div')
     div.textContent = name
@@ -192,11 +190,11 @@ function buildLabels3D(scene) {
       `pointer-events: none`,
       `white-space: nowrap`,
       `user-select: none`,
-      `transform: translate(-50%, -50%)`,  // centre the label on the point
+      `transform: translate(-50%, -50%)`,
     ].join(';')
 
     const obj = new CSS2DObject(div)
-    obj.position.copy(ll2v(lat, lng, R + 0.01))  // sit just on the surface
+    obj.position.copy(ll2v(lat, lng, R + 0.01))
     obj.userData = { mz, maxDist: maxDistFor(mz), div }
     obj.visible = false
     scene.add(obj)
@@ -554,7 +552,6 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
         const ud = obj.userData
         if (camDist > ud.maxDist) { obj.visible = false; return }
         const surfDir = obj.position.clone().normalize()
-        // dot > 0.1 means the country is on the front-facing hemisphere
         obj.visible = surfDir.dot(camNorm) > 0.1
       })
 
@@ -615,7 +612,7 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
       if (renderedRef.current.size > 600) renderedRef.current.clear()
 
       renderer.render(scene, camera)
-      css2d.render(scene, camera)   // render HTML labels on top
+      css2d.render(scene, camera)
     }
     animate()
 
