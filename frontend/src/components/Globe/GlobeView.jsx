@@ -1,14 +1,9 @@
 /**
  * GlobeView.jsx — 3D Globe + 2D Flat Map
  *
- * NEW: Cyberthreat Atmosphere — two-layer GLSL shader effect:
- *   Feature 1 — Boiling Mist  (buildMist):   sphere at 1.02R, animated hash-based
- *               pseudo-noise in fragment shader, BackSide, AdditiveBlending.
- *   Feature 2 — Evaporating Glow (buildAtmosphere): Fresnel limb-darkening with
- *               exponential density falloff, strongest at surface edge, 0 in space.
- *
- * LABEL APPROACH: CSS2DRenderer
- *   - Real HTML <div> labels always upright, stick to country surface
+ * Cyberthreat Atmosphere (fixed):
+ *   Mist  — BackSide sphere 1.18R: noise only in the outermost rim band, never on globe face
+ *   Glow  — BackSide sphere 1.5R:  wide Fresnel halo that bleeds into space
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
@@ -98,8 +93,6 @@ async function getTopoFeatures() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// 3D scene helpers
-// ─────────────────────────────────────────────────────────────────────────
 function buildStars(scene) {
   const N = 8000, pos = new Float32Array(N * 3), sz = new Float32Array(N)
   for (let i = 0; i < N; i++) {
@@ -151,206 +144,154 @@ async function buildCountryBorders(scene) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// FEATURE 2 — Evaporating Glow (Fresnel + Exponential Density Falloff)
+// FEATURE 2 — Evaporating Glow  (1.5R, BackSide)
+// Wide Fresnel halo that pushes deep into space.
+// BackSide + large radius = the glow is ONLY visible outside the globe
+// circumference, never as a green layer on top of the earth texture.
 // ═══════════════════════════════════════════════════════════════════════
-// Sphere at 1.015×R, BackSide so it wraps outside the globe.
-// Fresnel: glow is brightest at grazing angles (limb) where the dot-product
-// of the surface normal and view direction approaches 0.
-// Exponential falloff: exp(-k * rimPower) ensures opacity decays to 0 in space.
-// Color: Cyber Green #00ff66
 const GLOW_VERT = /* glsl */`
   varying vec3 vNormal;
   varying vec3 vViewDir;
   void main() {
-    // World-space normal for Fresnel
     vNormal  = normalize(normalMatrix * normal);
-    // View-space direction from vertex to camera
-    vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
-    vViewDir   = normalize(-mvPos.xyz);
-    gl_Position = projectionMatrix * mvPos;
+    vec4 mv  = modelViewMatrix * vec4(position, 1.0);
+    vViewDir = normalize(-mv.xyz);
+    gl_Position = projectionMatrix * mv;
   }
 `
-
 const GLOW_FRAG = /* glsl */`
   varying vec3 vNormal;
   varying vec3 vViewDir;
-
-  // Cyber Green
-  const vec3 CYBER_GREEN = vec3(0.0, 1.0, 0.4);  // #00ff66
-
   void main() {
-    // Fresnel term: 1 at edge (grazing), 0 at face-on
-    float rim = 1.0 - abs(dot(vNormal, vViewDir));
-    // Sharpen the rim band
-    rim = clamp(rim, 0.0, 1.0);
-    float rimPow = pow(rim, 3.2);
+    // rim = 0 at face-on, 1 at grazing edge
+    float rim    = 1.0 - abs(dot(vNormal, vViewDir));
+    rim          = clamp(rim, 0.0, 1.0);
 
-    // Exponential density falloff: most intense near surface edge, 0 in space
-    // k=4.5 gives a tight but visible band
-    float density = exp(-4.5 * (1.0 - rim));
-    float alpha   = rimPow * density * 0.55;
+    // Soft wide band: low power so glow fans wide into space
+    float rimPow = pow(rim, 1.8);
 
-    // Slight colour shift: deeper green at edge, lighter centre
-    vec3 col = mix(vec3(0.0, 0.9, 0.35), CYBER_GREEN, rimPow);
+    // Exponential density: strongest right at the limb, fades to 0 outward
+    float density = exp(-3.0 * (1.0 - rim));
+    float alpha   = rimPow * density * 0.72;
 
+    // Colour: inner edge brighter, outer edge deeper green
+    vec3 col = mix(vec3(0.0, 0.55, 0.22), vec3(0.0, 1.0, 0.4), rimPow);
     gl_FragColor = vec4(col, alpha);
   }
 `
 
 function buildAtmosphere(scene) {
-  const mesh = new THREE.Mesh(
-    new THREE.SphereGeometry(R * 1.015, 64, 64),
+  scene.add(new THREE.Mesh(
+    new THREE.SphereGeometry(R * 1.5, 64, 64),   // 1.5R as requested
     new THREE.ShaderMaterial({
       vertexShader:   GLOW_VERT,
       fragmentShader: GLOW_FRAG,
-      side:        THREE.BackSide,
+      side:        THREE.BackSide,   // only renders the inward-facing shell
       blending:    THREE.AdditiveBlending,
       transparent: true,
       depthWrite:  false,
     })
-  )
-  scene.add(mesh)
+  ))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// FEATURE 1 — Boiling Mist (Surface Crust with animated noise)
+// FEATURE 1 — Boiling Mist  (1.18R, BackSide)
+// BackSide on a sphere larger than the globe = fragments are only drawn
+// in the ring around the silhouette (outside the opaque earth disc).
+// The noise drives wispy vapour clouds erupting outward from the surface.
 // ═══════════════════════════════════════════════════════════════════════
-// Sphere at 1.02×R, FrontSide so it shows above the globe surface.
-// Fragment shader uses a fast GPU-hash-based Value Noise (3D) to create
-// drifting, boiling vapor patches that scroll with uTime.
-// Performance notes:
-//   • Low-segment sphere (48×48) — the shader does the detail work
-//   • depthWrite:false avoids expensive depth sorting
-//   • Only 3 octaves of noise (smooth enough, cheap enough)
 const MIST_VERT = /* glsl */`
-  varying vec3 vWorldPos;   // world position passed to frag for 3D noise
-  varying vec3 vNormal;
-  varying vec3 vViewDir;
-  void main() {
-    vec4 worldPos   = modelMatrix * vec4(position, 1.0);
-    vWorldPos       = worldPos.xyz;
-    vNormal         = normalize(normalMatrix * normal);
-    vec4 mvPos      = modelViewMatrix * vec4(position, 1.0);
-    vViewDir        = normalize(-mvPos.xyz);
-    gl_Position     = projectionMatrix * mvPos;
-  }
-`
-
-const MIST_FRAG = /* glsl */`
-  uniform float uTime;
   varying vec3 vWorldPos;
   varying vec3 vNormal;
   varying vec3 vViewDir;
+  void main() {
+    vec4 wp  = modelMatrix * vec4(position, 1.0);
+    vWorldPos = wp.xyz;
+    vNormal   = normalize(normalMatrix * normal);
+    vec4 mv   = modelViewMatrix * vec4(position, 1.0);
+    vViewDir  = normalize(-mv.xyz);
+    gl_Position = projectionMatrix * mv;
+  }
+`
+const MIST_FRAG = /* glsl */`
+  uniform float uTime;
+  varying vec3  vWorldPos;
+  varying vec3  vNormal;
+  varying vec3  vViewDir;
 
-  // ── Fast GPU hash (no texture lookup needed) ──────────────────────
-  // Jarzynski & Olano 2020 — single-pass 3D → float hash
   float hash31(vec3 p) {
     p  = fract(p * vec3(127.1, 311.7, 74.7));
     p += dot(p, p.yzx + 19.19);
     return fract((p.x + p.y) * p.z);
   }
-
-  // ── Value Noise: trilinear interpolation of random lattice ────────
   float vnoise(vec3 p) {
-    vec3 i = floor(p);
-    vec3 f = fract(p);
-    // Smoothstep fade
-    vec3 u = f * f * (3.0 - 2.0 * f);
-    float a = hash31(i);
-    float b = hash31(i + vec3(1,0,0));
-    float c = hash31(i + vec3(0,1,0));
-    float d = hash31(i + vec3(1,1,0));
-    float e = hash31(i + vec3(0,0,1));
-    float g = hash31(i + vec3(1,0,1));
-    float h = hash31(i + vec3(0,1,1));
-    float k = hash31(i + vec3(1,1,1));
-    return mix(
-      mix(mix(a,b,u.x), mix(c,d,u.x), u.y),
-      mix(mix(e,g,u.x), mix(h,k,u.x), u.y),
-      u.z
-    );
+    vec3 i = floor(p); vec3 f = fract(p);
+    vec3 u = f*f*(3.0-2.0*f);
+    float a=hash31(i),           b=hash31(i+vec3(1,0,0)),
+          c=hash31(i+vec3(0,1,0)),d=hash31(i+vec3(1,1,0)),
+          e=hash31(i+vec3(0,0,1)),g=hash31(i+vec3(1,0,1)),
+          h=hash31(i+vec3(0,1,1)),k=hash31(i+vec3(1,1,1));
+    return mix(mix(mix(a,b,u.x),mix(c,d,u.x),u.y),
+               mix(mix(e,g,u.x),mix(h,k,u.x),u.y),u.z);
   }
-
-  // ── 3-octave fBm for organic drifting vapour ──────────────────────
   float fbm(vec3 p) {
-    float v  = 0.0;
-    float amp = 0.5;
-    float freq = 1.0;
-    // 3 octaves — balanced quality vs. GPU cost
-    for (int i = 0; i < 3; i++) {
-      v   += amp * vnoise(p * freq);
-      freq *= 2.1;
-      amp  *= 0.48;
-    }
+    float v=0.,amp=0.5,freq=1.;
+    for(int i=0;i<3;i++){v+=amp*vnoise(p*freq);freq*=2.1;amp*=0.48;}
     return v;
   }
 
-  // Cyber Green
-  const vec3 CYBER_GREEN = vec3(0.0, 1.0, 0.4);
-  const vec3 DEEP_GREEN  = vec3(0.0, 0.6, 0.25);
+  const vec3 CYBER_GREEN = vec3(0.0, 1.0,  0.4);
+  const vec3 DEEP_GREEN  = vec3(0.0, 0.55, 0.22);
 
   void main() {
-    // Animate noise by drifting the sample point with time
-    // Using two slightly offset drifts for swirling motion
-    vec3 p1 = vWorldPos * 3.2 + vec3( uTime * 0.07,  uTime * 0.05, -uTime * 0.04);
-    vec3 p2 = vWorldPos * 5.8 + vec3(-uTime * 0.11,  uTime * 0.09,  uTime * 0.06);
-
-    float n1 = fbm(p1);           // large billowing patches
-    float n2 = fbm(p2) * 0.55;   // finer detail wisps
-    float n  = n1 + n2;
-
-    // Threshold: only render patches above noise midpoint (ethereal, not solid)
-    float mist = smoothstep(0.52, 0.95, n);
-
-    // Fresnel masking: mist is thinner where we look straight at the surface
+    // Rim factor: 0 = face-on, 1 = grazing (the outer ring)
     float rim = 1.0 - abs(dot(vNormal, vViewDir));
-    float fresnelMask = pow(clamp(rim, 0.0, 1.0), 1.2) * 0.65 + 0.35;
+    rim = clamp(rim, 0.0, 1.0);
 
-    // Final opacity — translucent, never opaque
-    float alpha = mist * fresnelMask * 0.30;
+    // ── Only show mist in the outer rim band ──────────────────────
+    // smoothstep gate: nothing below rim 0.55, full contribution at 0.75+
+    // This strictly confines the mist to outside the visible globe disc.
+    float rimGate = smoothstep(0.55, 0.78, rim);
+    if (rimGate < 0.001) discard;
 
-    // Colour varies between deep and bright green with noise intensity
-    vec3 col = mix(DEEP_GREEN, CYBER_GREEN, mist * 0.8);
+    // Animated noise
+    vec3 p1 = vWorldPos * 2.8 + vec3( uTime*0.06,  uTime*0.045, -uTime*0.035);
+    vec3 p2 = vWorldPos * 5.2 + vec3(-uTime*0.10,  uTime*0.08,   uTime*0.055);
+    float n  = fbm(p1) + fbm(p2)*0.5;
 
-    // Discard near-invisible fragments early (perf: avoids blending cost)
-    if (alpha < 0.01) discard;
+    // Threshold for ethereal patches
+    float mist = smoothstep(0.55, 1.0, n);
 
+    // Combine: rim gates position, mist gates shape
+    float alpha = mist * rimGate * 0.45;
+    if (alpha < 0.008) discard;
+
+    vec3 col = mix(DEEP_GREEN, CYBER_GREEN, mist * rimGate);
     gl_FragColor = vec4(col, alpha);
   }
 `
 
-/**
- * buildMist — returns the ShaderMaterial so the animate loop can tick uTime.
- */
 function buildMist(scene) {
   const mat = new THREE.ShaderMaterial({
-    uniforms: {
-      uTime: { value: 0.0 },
-    },
+    uniforms:      { uTime: { value: 0.0 } },
     vertexShader:   MIST_VERT,
     fragmentShader: MIST_FRAG,
-    side:        THREE.FrontSide,
+    side:        THREE.BackSide,       // KEY FIX: BackSide = only outside ring visible
     blending:    THREE.AdditiveBlending,
     transparent: true,
     depthWrite:  false,
   })
-  // Lower-res sphere — shader provides the visual detail
-  scene.add(new THREE.Mesh(new THREE.SphereGeometry(R * 1.02, 48, 48), mat))
+  scene.add(new THREE.Mesh(new THREE.SphereGeometry(R * 1.18, 48, 48), mat))
   return mat
 }
 
-/**
- * buildLabels3D — CSS2DObject approach
- * Font size tiers: 15 / 13.5 / 12 / 11 px
- */
+// ─────────────────────────────────────────────────────────────────────────
 function buildLabels3D(scene) {
   const labelObjects = []
-
   Object.entries(COUNTRIES).forEach(([code, { name, lat, lng }]) => {
     const mz     = MIN_ZOOM[code] ?? 3.5
     const isCity = CITY_KEYS.has(code)
     const fs     = mz <= 1.0 ? 15 : mz <= 1.5 ? 13.5 : mz <= 2.5 ? 12 : 11
-
     const div = document.createElement('div')
     div.textContent = name
     div.style.cssText = [
@@ -365,7 +306,6 @@ function buildLabels3D(scene) {
       `user-select: none`,
       `transform: translate(-50%, -50%)`,
     ].join(';')
-
     const obj = new CSS2DObject(div)
     obj.position.copy(ll2v(lat, lng, R + 0.01))
     obj.userData = { mz, maxDist: maxDistFor(mz), div }
@@ -373,7 +313,6 @@ function buildLabels3D(scene) {
     scene.add(obj)
     labelObjects.push(obj)
   })
-
   return labelObjects
 }
 
@@ -428,7 +367,7 @@ function FlatMapView({ filteredArcs, speedLevel }) {
     setTimeout(setSize, 0)
     const ro = new ResizeObserver(setSize); ro.observe(container)
 
-    const getXY  = e => e.touches ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : { x: e.clientX, y: e.clientY }
+    const getXY   = e => e.touches ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : { x: e.clientX, y: e.clientY }
     const getRect = () => canvas.getBoundingClientRect()
 
     const onDown = e => {
@@ -489,7 +428,6 @@ function FlatMapView({ filteredArcs, speedLevel }) {
       })
       ctx.closePath()
     }
-
     const overlaps = (boxes, x, y, w, h) => {
       const pad = 3
       for (const b of boxes) {
@@ -502,53 +440,43 @@ function FlatMapView({ filteredArcs, speedLevel }) {
     const draw = () => {
       const { W, H } = dimRef.current
       if (!W || !H) { rafRef.current = requestAnimationFrame(draw); return }
-
       const spd  = SPD2D[speedRef.current] ?? SPD2D[1]
       const arcs = filteredArcsRef.current
       const { scale: s, tx, ty } = xfRef.current
-
       const wx = lng => ((lng + 180) / 360) * W * s + tx
       const wy = lat => ((90  - lat) / 180) * H * s + ty
-
       const ids = new Set(arcs.map(a => a.id))
       Object.keys(arcStates.current).forEach(id => { if (!ids.has(id)) delete arcStates.current[id] })
       arcs.forEach(arc => { if (!arcStates.current[arc.id]) arcStates.current[arc.id] = { t: 0, impacted: false, alpha: 1, ringR: 0 } })
-
       ctx.fillStyle = '#030d07'
       ctx.fillRect(0, 0, W, H)
-
       if (countriesRef.current) {
         ctx.beginPath()
         countriesRef.current.forEach(f => {
           if (!f.geometry) return
-          if (f.geometry.type === 'Polygon')      f.geometry.coordinates.forEach(r => ringPath(r, wx, wy))
+          if (f.geometry.type === 'Polygon')           f.geometry.coordinates.forEach(r => ringPath(r, wx, wy))
           else if (f.geometry.type === 'MultiPolygon') f.geometry.coordinates.forEach(poly => poly.forEach(r => ringPath(r, wx, wy)))
         })
-        ctx.fillStyle = '#0d2016'
-        ctx.fill('evenodd')
-
+        ctx.fillStyle = '#0d2016'; ctx.fill('evenodd')
         ctx.strokeStyle = 'rgba(50,130,70,0.75)'
         ctx.lineWidth   = Math.max(0.25, 0.6 / s)
         countriesRef.current.forEach(f => {
           if (!f.geometry) return
           ctx.beginPath()
-          if (f.geometry.type === 'Polygon')      f.geometry.coordinates.forEach(r => ringPath(r, wx, wy))
+          if (f.geometry.type === 'Polygon')           f.geometry.coordinates.forEach(r => ringPath(r, wx, wy))
           else if (f.geometry.type === 'MultiPolygon') f.geometry.coordinates.forEach(poly => poly.forEach(r => ringPath(r, wx, wy)))
           ctx.stroke()
         })
       }
-
       const entries = Object.entries(COUNTRIES)
       const sorted  = entries.slice().sort((a, b) => (MIN_ZOOM[a[0]] ?? 3.5) - (MIN_ZOOM[b[0]] ?? 3.5))
-      ctx.textAlign    = 'center'
-      ctx.textBaseline = 'middle'
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
       const boxes = []
-
       sorted.forEach(([code, { name, lat, lng }]) => {
         const mz = MIN_ZOOM[code] ?? 3.5
         if (s < mz) return
         const px = wx(lng), py = wy(lat)
-        if (px < -100 || px > W + 100 || py < -30 || py > H + 30) return
+        if (px < -100 || px > W+100 || py < -30 || py > H+30) return
         const base = CITY_KEYS.has(code) ? 7 : 8
         const fs   = Math.min(11, base + (s - mz) * 0.9)
         if (fs < 6.5) return
@@ -561,50 +489,41 @@ function FlatMapView({ filteredArcs, speedLevel }) {
         ctx.fillStyle   = CITY_KEYS.has(code) ? 'rgba(70,185,210,.75)' : 'rgba(80,210,130,.82)'
         ctx.fillText(name, px, py); ctx.shadowBlur = 0
       })
-
       const dotR = Math.max(0.6, 1.2 / Math.sqrt(s))
       entries.forEach(([code, { lat, lng }]) => {
         if (CITY_KEYS.has(code) && s < 6) return
         const px = wx(lng), py = wy(lat)
         if (px < 0 || px > W || py < 0 || py > H) return
-        ctx.beginPath(); ctx.arc(px, py, dotR, 0, Math.PI * 2)
+        ctx.beginPath(); ctx.arc(px, py, dotR, 0, Math.PI*2)
         ctx.fillStyle = 'rgba(0,210,100,0.40)'; ctx.fill()
       })
-
       arcs.slice(0, 50).forEach(arc => {
         const st = arcStates.current[arc.id]; if (!st || st.alpha <= 0) return
         const col = arc.typeColor || '#00ff88'
         const sx  = wx(arc.sourceLng), sy = wy(arc.sourceLat)
         const tx2 = wx(arc.targetLng), ty2 = wy(arc.targetLat)
-        const mx  = (sx + tx2) / 2, my = (sy + ty2) / 2 - Math.min(H * .12, 55)
-        const bez = t => ({ x: (1-t)**2*sx + 2*(1-t)*t*mx + t**2*tx2, y: (1-t)**2*sy + 2*(1-t)*t*my + t**2*ty2 })
-
-        if (!st.impacted) { st.t = Math.min(st.t + spd, 1); if (st.t >= 1) st.impacted = true }
-        else { st.ringR += 1.8; st.alpha = Math.max(0, st.alpha - .025) }
-
-        ctx.beginPath(); ctx.moveTo(sx, sy); ctx.quadraticCurveTo(mx, my, tx2, ty2)
-        ctx.strokeStyle = col + '12'; ctx.lineWidth = 1; ctx.stroke()
-
-        if (!st.impacted || st.alpha > .5) {
-          const COMET = .13, tailT = Math.max(0, st.t - COMET)
-          ctx.beginPath(); let mv = false
-          for (let k = 0; k <= 20; k++) {
-            const t_ = tailT + (k/20) * (st.t - tailT); const p = bez(t_)
-            if (!mv) { ctx.moveTo(p.x, p.y); mv = true } else ctx.lineTo(p.x, p.y)
-          }
-          if (mv) { ctx.strokeStyle = col + 'cc'; ctx.lineWidth = arc.severity === 'critical' ? 2.5 : 1.5; ctx.stroke() }
-          const hp = bez(st.t)
-          ctx.beginPath(); ctx.arc(hp.x, hp.y, arc.severity === 'critical' ? 3.5 : 2.5, 0, Math.PI * 2)
-          ctx.fillStyle = col; ctx.shadowBlur = 10; ctx.shadowColor = col; ctx.fill(); ctx.shadowBlur = 0
+        const mx  = (sx + tx2)/2, my = (sy+ty2)/2 - Math.min(H*.12, 55)
+        const bez = t => ({ x:(1-t)**2*sx+2*(1-t)*t*mx+t**2*tx2, y:(1-t)**2*sy+2*(1-t)*t*my+t**2*ty2 })
+        if (!st.impacted) { st.t = Math.min(st.t+spd,1); if (st.t>=1) st.impacted=true }
+        else { st.ringR+=1.8; st.alpha=Math.max(0,st.alpha-.025) }
+        ctx.beginPath(); ctx.moveTo(sx,sy); ctx.quadraticCurveTo(mx,my,tx2,ty2)
+        ctx.strokeStyle=col+'12'; ctx.lineWidth=1; ctx.stroke()
+        if (!st.impacted||st.alpha>.5) {
+          const COMET=.13,tailT=Math.max(0,st.t-COMET)
+          ctx.beginPath(); let mv=false
+          for(let k=0;k<=20;k++){const t_=tailT+(k/20)*(st.t-tailT);const p=bez(t_);if(!mv){ctx.moveTo(p.x,p.y);mv=true}else ctx.lineTo(p.x,p.y)}
+          if(mv){ctx.strokeStyle=col+'cc';ctx.lineWidth=arc.severity==='critical'?2.5:1.5;ctx.stroke()}
+          const hp=bez(st.t)
+          ctx.beginPath();ctx.arc(hp.x,hp.y,arc.severity==='critical'?3.5:2.5,0,Math.PI*2)
+          ctx.fillStyle=col;ctx.shadowBlur=10;ctx.shadowColor=col;ctx.fill();ctx.shadowBlur=0
         }
-        if (st.impacted && st.ringR > 0) {
-          const tp2 = bez(1)
-          ctx.beginPath(); ctx.arc(tp2.x, tp2.y, st.ringR, 0, Math.PI * 2)
-          ctx.strokeStyle = col + Math.round(st.alpha * 160).toString(16).padStart(2, '0')
-          ctx.lineWidth = 1.5; ctx.stroke()
+        if(st.impacted&&st.ringR>0){
+          const tp2=bez(1)
+          ctx.beginPath();ctx.arc(tp2.x,tp2.y,st.ringR,0,Math.PI*2)
+          ctx.strokeStyle=col+Math.round(st.alpha*160).toString(16).padStart(2,'0')
+          ctx.lineWidth=1.5;ctx.stroke()
         }
       })
-
       rafRef.current = requestAnimationFrame(draw)
     }
     draw()
@@ -621,24 +540,24 @@ function FlatMapView({ filteredArcs, speedLevel }) {
     }
   }, [])
 
-  const doZoom    = f => zoomAt(dimRef.current.W / 2, dimRef.current.H / 2, f)
-  const resetZoom = ()  => { xfRef.current = { scale: 1, tx: 0, ty: 0 } }
+  const doZoom    = f => zoomAt(dimRef.current.W/2, dimRef.current.H/2, f)
+  const resetZoom = ()  => { xfRef.current = { scale:1, tx:0, ty:0 } }
 
   return (
-    <div ref={containerRef} style={{ position: 'absolute', inset: 0, background: '#030d07', overflow: 'hidden' }}>
-      <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%', cursor: 'grab' }} />
-      <div style={{ position: 'absolute', bottom: 58, right: 12, display: 'flex', flexDirection: 'column', gap: 4, zIndex: 20 }}>
-        {[{ l: '+', f: 1.5 }, { l: '\u2212', f: 1/1.5 }, { l: '\u2302', f: null }].map(({ l, f }) => (
+    <div ref={containerRef} style={{ position:'absolute', inset:0, background:'#030d07', overflow:'hidden' }}>
+      <canvas ref={canvasRef} style={{ display:'block', width:'100%', height:'100%', cursor:'grab' }} />
+      <div style={{ position:'absolute', bottom:58, right:12, display:'flex', flexDirection:'column', gap:4, zIndex:20 }}>
+        {[{ l:'+', f:1.5 },{ l:'\u2212', f:1/1.5 },{ l:'\u2302', f:null }].map(({ l, f }) => (
           <button key={l} onClick={() => f ? doZoom(f) : resetZoom()}
-            style={{ width: 28, height: 28, background: 'rgba(0,20,10,.9)', border: '1px solid rgba(0,200,80,.4)',
-              color: '#00cc66', borderRadius: 4, fontFamily: 'monospace', fontSize: 16, cursor: 'pointer',
-              textAlign: 'center', lineHeight: '26px', padding: 0, userSelect: 'none' }}>
+            style={{ width:28, height:28, background:'rgba(0,20,10,.9)', border:'1px solid rgba(0,200,80,.4)',
+              color:'#00cc66', borderRadius:4, fontFamily:'monospace', fontSize:16, cursor:'pointer',
+              textAlign:'center', lineHeight:'26px', padding:0, userSelect:'none' }}>
             {l}
           </button>
         ))}
       </div>
-      <div style={{ position: 'absolute', bottom: 58, left: 12, zIndex: 20, fontFamily: 'monospace',
-        fontSize: 10, color: 'rgba(0,200,80,.4)', pointerEvents: 'none' }}>
+      <div style={{ position:'absolute', bottom:58, left:12, zIndex:20, fontFamily:'monospace',
+        fontSize:10, color:'rgba(0,200,80,.4)', pointerEvents:'none' }}>
         scroll/drag · pan+zoom
       </div>
     </div>
@@ -660,11 +579,11 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     const el = mountRef.current; if (!el) return
     const W = el.clientWidth || 800, H = el.clientHeight || 600
 
-    const scene    = new THREE.Scene()
-    const camera   = new THREE.PerspectiveCamera(45, W/H, .1, 100)
+    const scene  = new THREE.Scene()
+    const camera = new THREE.PerspectiveCamera(45, W/H, .1, 100)
     camera.position.z = 2.5
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
+    const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true })
     renderer.setSize(W, H)
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     el.appendChild(renderer.domElement)
@@ -672,9 +591,9 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     const css2d = new CSS2DRenderer()
     css2d.setSize(W, H)
     css2d.domElement.style.cssText = [
-      'position:absolute', 'top:0', 'left:0',
-      'width:100%', 'height:100%',
-      'pointer-events:none', 'overflow:hidden',
+      'position:absolute','top:0','left:0',
+      'width:100%','height:100%',
+      'pointer-events:none','overflow:hidden',
     ].join(';')
     el.appendChild(css2d.domElement)
 
@@ -695,41 +614,35 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     buildStars(scene)
     buildGlobe(scene)
 
-    // ── Cyberthreat Atmosphere ────────────────────────────────────
-    // Order matters for additive blending:
-    //   1. Boiling Mist  (1.02R, FrontSide) — surface crust noise
-    //   2. Evaporating Glow (1.015R, BackSide) — Fresnel limb glow
-    // Glow is rendered second so it composites correctly on top.
-    const mistMat = buildMist(scene)       // returns mat to tick uTime
-    buildAtmosphere(scene)
-    // ─────────────────────────────────────────────────────────────
+    // Render order: Glow first (widest, outermost), then Mist (tighter ring)
+    buildAtmosphere(scene)        // 1.5R  BackSide glow
+    const mistMat = buildMist(scene)   // 1.18R BackSide noise mist
 
     const labelObjects = buildLabels3D(scene)
     buildCountryBorders(scene)
 
-    const missilesGrp = new THREE.Group(), trailsGrp = new THREE.Group(), spikesGrp = new THREE.Group()
+    const missilesGrp = new THREE.Group()
+    const trailsGrp   = new THREE.Group()
+    const spikesGrp   = new THREE.Group()
     scene.add(missilesGrp, trailsGrp, spikesGrp)
 
     const onResize = () => {
       const nW = el.clientWidth, nH = el.clientHeight
-      camera.aspect = nW / nH; camera.updateProjectionMatrix()
+      camera.aspect = nW/nH; camera.updateProjectionMatrix()
       renderer.setSize(nW, nH); css2d.setSize(nW, nH)
     }
     window.addEventListener('resize', onResize)
 
-    const clock = new THREE.Clock()  // for uTime
+    const clock = new THREE.Clock()
 
     let rafId
     const animate = () => {
       rafId = requestAnimationFrame(animate)
       controls.update()
-
-      // ── Tick mist shader time ──────────────────────────────────
       mistMat.uniforms.uTime.value = clock.getElapsedTime()
 
       const camDist = camera.position.length()
       const camNorm = camera.position.clone().normalize()
-
       labelObjects.forEach(obj => {
         const ud = obj.userData
         if (camDist > ud.maxDist) { obj.visible = false; return }
@@ -752,13 +665,13 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
           if (ud.t >= 1) {
             ud.state = 'impact'
             for (let i = 0; i < (ud.isCrit ? 5 : 3); i++) {
-              const bPos = ll2v(ud.targetLat + (Math.random()-.5)*.8, ud.targetLng + (Math.random()-.5)*.8, R)
+              const bPos = ll2v(ud.targetLat+(Math.random()-.5)*.8, ud.targetLng+(Math.random()-.5)*.8, R)
               const spk  = new THREE.Line(
                 new THREE.BufferGeometry().setFromPoints([bPos.clone(), bPos.clone()]),
                 new THREE.LineBasicMaterial({ color: ud.color, transparent: true, opacity: 0 })
               )
               spk.userData = { base: bPos.clone(), norm: bPos.clone().normalize(),
-                maxH: .04 + Math.random() * .055, age: 0, delay: i*6, maxAge: 150 + i*20, done: false }
+                maxH: .04+Math.random()*.055, age:0, delay:i*6, maxAge:150+i*20, done:false }
               spikesGrp.add(spk)
             }
           }
@@ -769,21 +682,19 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
           if (m.material.opacity <= 0) ud.state = 'done'
         }
       })
-
       spikesGrp.children.forEach(spk => {
         const ud = spk.userData
         if (ud.delay > 0) { ud.delay -= 1; return }
         ud.age += 1; const t = ud.age / ud.maxAge
         let h, op
-        if (t < .15)      { h = (t/.15) * ud.maxH; op = t/.15 }
-        else if (t < .72) { h = ud.maxH * (1 + .09 * Math.sin(ud.age * .35)); op = 1 }
-        else              { const f = (t-.72)/.28; h = ud.maxH*(1-f*.4); op = 1-f }
+        if (t < .15)      { h=(t/.15)*ud.maxH; op=t/.15 }
+        else if (t < .72) { h=ud.maxH*(1+.09*Math.sin(ud.age*.35)); op=1 }
+        else              { const f=(t-.72)/.28; h=ud.maxH*(1-f*.4); op=1-f }
         spk.geometry.setFromPoints([ud.base.clone(), ud.base.clone().add(ud.norm.clone().multiplyScalar(h))])
         spk.material.opacity = Math.max(0, op)
         if (ud.age >= ud.maxAge) ud.done = true
       })
-
-      missilesGrp.children.filter(m => m.userData.state === 'done').forEach(m => {
+      missilesGrp.children.filter(m => m.userData.state==='done').forEach(m => {
         m.geometry.dispose(); m.material.dispose()
         if (m.userData.trail) { m.userData.trail.geometry.dispose(); m.userData.trail.material.dispose(); trailsGrp.remove(m.userData.trail) }
         if (m.userData.ghost) { m.userData.ghost.geometry.dispose(); m.userData.ghost.material.dispose(); trailsGrp.remove(m.userData.ghost) }
@@ -816,17 +727,17 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
       const pts    = arcPoints(arc)
       const col    = new THREE.Color(arc.typeColor || '#00ff88')
       const isCrit = arc.severity === 'critical'
-      const ghost  = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: .06 }))
-      const trail  = new THREE.Line(new THREE.BufferGeometry().setFromPoints([pts[0].clone(), pts[0].clone()]), new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: isCrit ? .95 : .72 }))
-      const missile = new THREE.Mesh(new THREE.SphereGeometry(isCrit ? .013 : .009, 6, 6), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 1 }))
+      const ghost  = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color:col, transparent:true, opacity:.06 }))
+      const trail  = new THREE.Line(new THREE.BufferGeometry().setFromPoints([pts[0].clone(),pts[0].clone()]), new THREE.LineBasicMaterial({ color:col, transparent:true, opacity:isCrit?.95:.72 }))
+      const missile = new THREE.Mesh(new THREE.SphereGeometry(isCrit?.013:.009,6,6), new THREE.MeshBasicMaterial({ color:col, transparent:true, opacity:1 }))
       missile.position.copy(pts[0])
-      missile.userData = { points: pts, t: 0, state: 'flying', color: col, isCrit,
-        targetPos: pts[pts.length-1].clone(), targetLat: arc.targetLat, targetLng: arc.targetLng, trail, ghost }
+      missile.userData = { points:pts, t:0, state:'flying', color:col, isCrit,
+        targetPos:pts[pts.length-1].clone(), targetLat:arc.targetLat, targetLng:arc.targetLng, trail, ghost }
       trailsGrp.add(ghost); trailsGrp.add(trail); missilesGrp.add(missile)
     })
   }, [filteredArcs])
 
-  return <div ref={mountRef} style={{ position: 'relative', width: '100%', height: '100%' }} />
+  return <div ref={mountRef} style={{ position:'relative', width:'100%', height:'100%' }} />
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -835,23 +746,23 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
 export default function GlobeView() {
   const { globeView, heatmapActive, attacks, isRotating, speedLevel, selectedTypes, selectedSeverities } = useStore()
   const [webglOk] = useState(() => {
-    try { const c = document.createElement('canvas'); return !!(window.WebGLRenderingContext && (c.getContext('webgl') || c.getContext('experimental-webgl'))) } catch { return false }
+    try { const c = document.createElement('canvas'); return !!(window.WebGLRenderingContext&&(c.getContext('webgl')||c.getContext('experimental-webgl'))) } catch { return false }
   })
   const filteredArcs = attacks
     .filter(a => selectedTypes.includes(a.type) && selectedSeverities.includes(a.severity))
     .slice(0, 60)
 
   if (globeView === 'flat' || !webglOk) return (
-    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+    <div style={{ position:'relative', width:'100%', height:'100%' }}>
       <FlatMapView filteredArcs={filteredArcs} speedLevel={speedLevel} />
       {!webglOk && <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-yellow-500/20 border border-yellow-500/40 text-yellow-300 text-xs px-3 py-1.5 rounded-lg">WebGL unavailable</div>}
     </div>
   )
 
   return (
-    <div style={{ position: 'relative', width: '100%', height: '100%', background: '#000' }}>
+    <div style={{ position:'relative', width:'100%', height:'100%', background:'#000' }}>
       <ThreeGlobe filteredArcs={filteredArcs} isRotating={isRotating} speedLevel={speedLevel} />
-      {heatmapActive && <div className="absolute inset-0 pointer-events-none" style={{ background: 'radial-gradient(ellipse at 35% 45%,rgba(0,60,200,.05) 0%,transparent 55%),radial-gradient(ellipse at 65% 55%,rgba(100,0,200,.04) 0%,transparent 50%)' }} />}
+      {heatmapActive && <div className="absolute inset-0 pointer-events-none" style={{ background:'radial-gradient(ellipse at 35% 45%,rgba(0,60,200,.05) 0%,transparent 55%),radial-gradient(ellipse at 65% 55%,rgba(100,0,200,.04) 0%,transparent 50%)' }} />}
     </div>
   )
 }
