@@ -11,28 +11,23 @@
  *   so the WebGL canvas is never transparent.
  *
  * ATMOSPHERE (Kaspersky Fresnel glow):
- *   4-shell Fresnel stack rendered on BackSide spheres with AdditiveBlending:
- *   1. Inner rim  — r=1.08, tight pow(rim,4) falloff, Kaspersky teal #00A88E
- *   2. Corona     — r=1.20, pow(rim,3.5) wider halo, same teal
- *   3. Outer halo — r=1.55, pow(rim,2.5) very soft bleed into space
- *   4. Deep halo  — r=2.20, pow(rim,1.8) faint galaxy-edge glow
- *   Each shell's vertex shader passes the view-space normal (vNormal) so the
- *   fragment shader can compute dot(normalize(vNormal), vec3(0,0,1)) which is
- *   the classic Fresnel/rim formula — giving exactly 0 opacity at the center
- *   and max opacity at the limb.
- *   Animated mist (FrontSide) rides on top for the cloud-wisp look.
+ *   4-shell Fresnel stack rendered on BackSide spheres with AdditiveBlending.
+ *   No mist — pure clean rim-light only.
+ *   1. Inner rim  — r=1.08, pow(rim,5.0), strength=0.72  → tight Kaspersky teal
+ *   2. Corona     — r=1.20, pow(rim,3.5), strength=0.45  → soft inner halo
+ *   3. Outer halo — r=1.55, pow(rim,2.5), strength=0.22  → wide atmosphere
+ *   4. Deep halo  — r=2.20, pow(rim,1.8), strength=0.07  → space bleed
  *
  * 2D MAP FIX (land/sea inversion + horizontal lines):
  *   Each country polygon gets its OWN beginPath()/fill('nonzero') call.
  *   Antimeridian crossings (lng jump >180) lift the pen with moveTo().
  *
  * LAYER ORDER (back → front):
- *   Stars        — renderOrder 0
- *   Globe mesh   — renderOrder 1
- *   Fresnel halos — renderOrder 2  (BackSide, AdditiveBlending)
- *   Mist         — renderOrder 3  (FrontSide, AdditiveBlending)
- *   Borders      — renderOrder 4
- *   Missiles/arcs — renderOrder 5+
+ *   Stars          — renderOrder 0
+ *   Globe mesh     — renderOrder 1
+ *   Fresnel halos  — renderOrder 2  (BackSide, AdditiveBlending)
+ *   Borders        — renderOrder 4
+ *   Missiles/arcs  — renderOrder 5+
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
@@ -144,43 +139,27 @@ function buildStars(scene) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// buildAtmosphere — Kaspersky-style Fresnel rim-light glow
+// buildAtmosphere — Kaspersky-style Fresnel rim-light glow (4 shells only)
 //
-// The Fresnel formula: intensity = pow(1.0 - dot(vNormal, vec3(0,0,1)), power)
-//   vNormal is the view-space normal (from normalMatrix * normal).
-//   When the surface faces the camera (center of globe), dot ≈ 1 → intensity ≈ 0
-//   When the surface is edge-on (limb of globe),     dot ≈ 0 → intensity ≈ 1
+// Fresnel formula: intensity = pow(1.0 - dot(vNormal, vec3(0,0,1)), power)
+//   vNormal = view-space normal via normalMatrix * normal.
+//   Center of globe → dot ≈ 1 → intensity ≈ 0  (transparent)
+//   Limb of globe   → dot ≈ 0 → intensity ≈ 1  (bright rim)
 //
-// We use THREE.BackSide so the sphere renders its inner face — meaning
-// the normals point toward the camera at the limb, giving us the rim glow
-// without occluding the globe itself.
-//
-// 4 shells stacked with AdditiveBlending:
-//   Shell A r=1.08  power=5.0  strength=0.72  → tight Kaspersky teal rim
-//   Shell B r=1.20  power=3.5  strength=0.45  → wider soft corona
-//   Shell C r=1.55  power=2.5  strength=0.22  → outer atmosphere bleed
-//   Shell D r=2.20  power=1.8  strength=0.08  → deep-space haze
+// THREE.BackSide renders the inner face of the sphere so its normals
+// point toward the camera at the limb — giving the rim glow without
+// occluding the globe surface.
+// AdditiveBlending makes the stacked shells look like real light emission.
 // ═══════════════════════════════════════════════════════════════════════
 
-// Shared Fresnel vertex shader — passes the VIEW-SPACE normal to the fragment.
-// Critical: we use normalMatrix (inverse-transpose of modelViewMatrix) so the
-// normal is correctly transformed even when the sphere is scaled non-uniformly.
 const FRESNEL_VERT = /* glsl */`
   varying vec3 vNormal;
-  varying vec3 vViewPos;
   void main() {
-    // View-space normal — used for Fresnel dot product
-    vNormal  = normalize(normalMatrix * normal);
-    vec4 mv  = modelViewMatrix * vec4(position, 1.0);
-    vViewPos = mv.xyz;
-    gl_Position = projectionMatrix * mv;
+    vNormal     = normalize(normalMatrix * normal);
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
   }
 `
 
-// Fresnel fragment shader.
-// dot(vNormal, vec3(0,0,1)) is the cosine of the angle between the
-// surface normal and the camera look direction in view space.
-// pow(clamp(1.0 - that_dot, 0.0, 1.0), power) peaks at the limb.
 const makeFresnel = (r, g, b, power, strength) => new THREE.ShaderMaterial({
   uniforms: {
     uColor:    { value: new THREE.Color(r, g, b) },
@@ -193,9 +172,7 @@ const makeFresnel = (r, g, b, power, strength) => new THREE.ShaderMaterial({
     uniform float uPower;
     uniform float uStrength;
     varying vec3  vNormal;
-    varying vec3  vViewPos;
     void main() {
-      // View direction in view space is always (0,0,1) toward camera
       float cosA      = dot(normalize(vNormal), vec3(0.0, 0.0, 1.0));
       float rim       = clamp(1.0 - cosA, 0.0, 1.0);
       float intensity = pow(rim, uPower) * uStrength;
@@ -210,108 +187,25 @@ const makeFresnel = (r, g, b, power, strength) => new THREE.ShaderMaterial({
 })
 
 function buildAtmosphere(scene) {
-  // Kaspersky teal: #00A88E = rgb(0, 168, 142) → normalized (0, 0.659, 0.557)
-  // We use a slightly brighter teal to work well with additive blending
-  const KR = 0.00, KG = 0.72, KB = 0.58   // #00B894 — Kaspersky teal
-  const OR = 0.00, OG = 0.55, OB = 0.38   // outer halos lean green
+  // Kaspersky teal palette
+  const KR = 0.00, KG = 0.72, KB = 0.58   // inner shells — #00B894
+  const OR = 0.00, OG = 0.55, OB = 0.38   // outer shells — softer green
 
-  // Shell A: Tight inner rim — most visible part of the Kaspersky glow
-  const shellA = new THREE.Mesh(
-    new THREE.SphereGeometry(1.08, 96, 96),
-    makeFresnel(KR, KG, KB, 5.0, 0.72)
-  )
+  // Shell A: tight inner rim
+  const shellA = new THREE.Mesh(new THREE.SphereGeometry(1.08, 96, 96), makeFresnel(KR, KG, KB, 5.0, 0.72))
   shellA.renderOrder = 2; scene.add(shellA)
 
-  // Shell B: Soft corona — bleeds ~20% beyond the globe edge
-  const shellB = new THREE.Mesh(
-    new THREE.SphereGeometry(1.20, 96, 96),
-    makeFresnel(KR, KG, KB, 3.5, 0.45)
-  )
+  // Shell B: soft inner corona
+  const shellB = new THREE.Mesh(new THREE.SphereGeometry(1.20, 96, 96), makeFresnel(KR, KG, KB, 3.5, 0.45))
   shellB.renderOrder = 2; scene.add(shellB)
 
-  // Shell C: Outer atmosphere — the wide hazy aura
-  const shellC = new THREE.Mesh(
-    new THREE.SphereGeometry(1.55, 64, 64),
-    makeFresnel(OR, OG, OB, 2.5, 0.22)
-  )
+  // Shell C: wide outer atmosphere
+  const shellC = new THREE.Mesh(new THREE.SphereGeometry(1.55, 64, 64), makeFresnel(OR, OG, OB, 2.5, 0.22))
   shellC.renderOrder = 2; scene.add(shellC)
 
-  // Shell D: Deep-space glow — very faint, bleeds into starfield
-  const shellD = new THREE.Mesh(
-    new THREE.SphereGeometry(2.20, 48, 48),
-    makeFresnel(OR, OG * 0.7, OB * 0.5, 1.8, 0.07)
-  )
+  // Shell D: deep-space haze
+  const shellD = new THREE.Mesh(new THREE.SphereGeometry(2.20, 48, 48), makeFresnel(OR, OG * 0.7, OB * 0.5, 1.8, 0.07))
   shellD.renderOrder = 2; scene.add(shellD)
-
-  // Animated mist — FrontSide, uses the same Fresnel rim to concentrate
-  // the wispy cloud effect at the limb of the globe, matching Kaspersky's
-  // evaporating-mist look
-  const makeMistMat = (seed, amount) => new THREE.ShaderMaterial({
-    uniforms: {
-      uTime:  { value: 0 },
-      uSeed:  { value: seed },
-      uAmt:   { value: amount },
-      uColor: { value: new THREE.Color(KR, KG, KB) },
-    },
-    vertexShader: /* glsl */`
-      varying vec3 vWorld;
-      varying vec3 vNormal;
-      varying vec3 vViewPos;
-      void main() {
-        vNormal  = normalize(normalMatrix * normal);
-        vec4 mv  = modelViewMatrix * vec4(position, 1.0);
-        vViewPos = mv.xyz;
-        vWorld   = (modelMatrix * vec4(position, 1.0)).xyz;
-        gl_Position = projectionMatrix * mv;
-      }
-    `,
-    fragmentShader: /* glsl */`
-      uniform float uTime;
-      uniform float uSeed;
-      uniform float uAmt;
-      uniform vec3  uColor;
-      varying vec3  vWorld;
-      varying vec3  vNormal;
-      varying vec3  vViewPos;
-
-      float hash(vec3 p) {
-        p = fract(p * 0.3183099 + uSeed); p *= 17.0;
-        return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
-      }
-      float noise(vec3 p) {
-        float n = 0.0, a = 0.55;
-        for (int i = 0; i < 4; i++) { n += a * hash(p); p *= 1.8; a *= 0.55; }
-        return n;
-      }
-      void main() {
-        // Fresnel rim factor — same formula as the halo shells
-        float cosA = dot(normalize(vNormal), vec3(0.0, 0.0, 1.0));
-        float rim  = clamp(1.0 - cosA, 0.0, 1.0);
-        float base = pow(rim, 1.2);   // concentrate mist at the limb
-
-        // Animated noise for wispy look
-        vec3 p = normalize(vWorld) * 2.5;
-        p += vec3(uTime*0.04, uTime*0.025, -uTime*0.035);
-        float fog = smoothstep(0.35, 0.88, noise(p)) * base;
-
-        float alpha = clamp(fog * uAmt, 0.0, 0.10);
-        gl_FragColor = vec4(uColor * alpha, alpha);
-      }
-    `,
-    transparent: true,
-    blending:    THREE.AdditiveBlending,
-    depthWrite:  false,
-    depthTest:   true,
-    side:        THREE.FrontSide,
-  })
-
-  const mist1 = new THREE.Mesh(new THREE.SphereGeometry(1.12, 96, 96), makeMistMat(1.3,  0.08))
-  const mist2 = new THREE.Mesh(new THREE.SphereGeometry(1.38, 96, 96), makeMistMat(7.7,  0.055))
-  mist1.renderOrder = 3
-  mist2.renderOrder = 3
-  scene.add(mist1, mist2)
-
-  return { mistMats: [mist1.material, mist2.material] }
 }
 
 function buildGlobe(scene) {
@@ -384,11 +278,6 @@ function buildLabels3D(scene) {
 
 // ═══════════════════════════════════════════════════════════════════════
 // FLAT 2-D MAP — canvas-based Mercator projection
-//
-// KEY FIX: each country polygon is drawn in its own beginPath()/fill()
-// using the 'nonzero' winding rule. The old single-path 'evenodd'
-// approach caused antimeridian-crossing polygons (Russia, USA/Alaska,
-// Canada, Fiji…) to produce screen-wide horizontal fill inversions.
 // ═══════════════════════════════════════════════════════════════════════
 function FlatMapView({ filteredArcs, speedLevel, visible }) {
   const containerRef    = useRef(null)
@@ -733,7 +622,7 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel, visible }) {
 
     buildStars(scene)
     buildGlobe(scene)
-    const fx = buildAtmosphere(scene)
+    buildAtmosphere(scene)
     const labelObjects = buildLabels3D(scene)
     buildCountryBorders(scene)
 
@@ -820,8 +709,6 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel, visible }) {
       spikesGrp.children.filter(s => s.userData.done).forEach(s => { s.geometry.dispose(); s.material.dispose(); spikesGrp.remove(s) })
       if (renderedRef.current.size > 600) renderedRef.current.clear()
 
-      const _t = performance.now() * 0.001
-      fx?.mistMats?.forEach(m => { m.uniforms.uTime.value = _t })
       renderer.render(scene, camera)
       css2d.render(scene, camera)
     }
