@@ -1,12 +1,14 @@
 /**
  * GlobeView.jsx — 3D Globe + 2D Flat Map
  *
- * ATMOSPHERE APPROACH (final):
- *   A THREE.BackSide sphere at radius 1.18 with a custom ShaderMaterial.
- *   BackSide means it only renders the inside-facing surface as seen from
- *   outside — i.e. only the rim/limb is visible. The globe FrontSide mesh
- *   (radius 1.0) writes to the depth buffer and naturally occludes the
- *   atmosphere sphere on the globe face. Zero sprite sizing math needed.
+ * SWITCH STRATEGY:
+ *   Both ThreeGlobe and FlatMapView are ALWAYS mounted.
+ *   We toggle CSS visibility/pointerEvents so neither view
+ *   gets destroyed — giving instant, seamless switching with
+ *   no re-init cost and no WebGL context loss.
+ *
+ *   Green-flash fix: alpha:false + setClearColor + scene.background
+ *   so the WebGL canvas is never transparent.
  *
  * LAYER ORDER (back → front):
  *   Stars          — renderOrder 0
@@ -15,13 +17,6 @@
  *   Country lines  — renderOrder 3
  *   Mist           — renderOrder 3
  *   Missiles/arcs  — renderOrder 4+
- *
- * BUG FIXES (2026-02-26):
- *   - Removed stale `fx` reference in FlatMapView cleanup (was undefined → threw)
- *   - Added `key` prop to ThreeGlobe / FlatMapView to force clean unmount/remount
- *     on mode switch — eliminates the green WebGL canvas bleed-through.
- *   - Applied `globe-container` CSS class to all wrapper divs so index.css
- *     vignette/glow rules take effect.
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
@@ -133,7 +128,7 @@ function buildStars(scene) {
 }
 
 function buildAtmosphere(scene) {
-  // Shell 1: Main corona — exponential falloff from globe edge outward
+  // Shell 1: Main corona
   const coronaMat = new THREE.ShaderMaterial({
     vertexShader: `
       varying vec3 vWorld;
@@ -189,17 +184,11 @@ function buildAtmosphere(scene) {
   haloMesh.renderOrder = 2
   scene.add(haloMesh)
 
-  // Shell 3: Animated mist wisps
+  // Shell 3: Animated mist
   const makeMistMat = (seed, amount) => new THREE.ShaderMaterial({
-    uniforms: {
-      uTime: { value: 0 },
-      uSeed: { value: seed },
-      uAmt:  { value: amount },
-    },
+    uniforms: { uTime: { value: 0 }, uSeed: { value: seed }, uAmt: { value: amount } },
     vertexShader: `
-      varying vec3 vWorld;
-      varying vec3 vNormal;
-      varying vec3 vViewPos;
+      varying vec3 vWorld; varying vec3 vNormal; varying vec3 vViewPos;
       void main() {
         vNormal  = normalize(normalMatrix * normal);
         vec4 mv  = modelViewMatrix * vec4(position, 1.0);
@@ -209,12 +198,8 @@ function buildAtmosphere(scene) {
       }
     `,
     fragmentShader: `
-      uniform float uTime;
-      uniform float uSeed;
-      uniform float uAmt;
-      varying vec3 vWorld;
-      varying vec3 vNormal;
-      varying vec3 vViewPos;
+      uniform float uTime; uniform float uSeed; uniform float uAmt;
+      varying vec3 vWorld; varying vec3 vNormal; varying vec3 vViewPos;
       float hash(vec3 p) {
         p = fract(p * 0.3183099 + uSeed); p *= 17.0;
         return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
@@ -234,11 +219,8 @@ function buildAtmosphere(scene) {
         gl_FragColor = vec4(0.0, 0.65, 0.22, clamp(fog * uAmt, 0.0, 0.08));
       }
     `,
-    transparent: true,
-    blending:    THREE.AdditiveBlending,
-    depthWrite:  false,
-    depthTest:   true,
-    side:        THREE.FrontSide,
+    transparent: true, blending: THREE.AdditiveBlending,
+    depthWrite: false, depthTest: true, side: THREE.FrontSide,
   })
 
   const mist1 = new THREE.Mesh(new THREE.SphereGeometry(1.12, 96, 96), makeMistMat(1.3, 0.07))
@@ -321,7 +303,7 @@ function buildLabels3D(scene) {
 // ═══════════════════════════════════════════════════════════════════════
 // FLAT 2-D MAP
 // ═══════════════════════════════════════════════════════════════════════
-function FlatMapView({ filteredArcs, speedLevel }) {
+function FlatMapView({ filteredArcs, speedLevel, visible }) {
   const containerRef    = useRef(null)
   const canvasRef       = useRef(null)
   const speedRef        = useRef(speedLevel)
@@ -337,6 +319,20 @@ function FlatMapView({ filteredArcs, speedLevel }) {
   useEffect(() => { speedRef.current = speedLevel }, [speedLevel])
   useEffect(() => { filteredArcsRef.current = filteredArcs }, [filteredArcs])
   useEffect(() => { getTopoFeatures().then(f => { countriesRef.current = f }).catch(console.warn) }, [])
+
+  // Trigger resize when visibility changes so canvas dimensions are correct
+  useEffect(() => {
+    if (visible && containerRef.current) {
+      const r  = containerRef.current.getBoundingClientRect()
+      const nw = Math.floor(r.width)  || 800
+      const nh = Math.floor(r.height) || 600
+      dimRef.current = { W: nw, H: nh }
+      if (canvasRef.current) {
+        canvasRef.current.width  = nw
+        canvasRef.current.height = nh
+      }
+    }
+  }, [visible])
 
   const clampXf = (xf, W, H) => {
     const s = Math.max(1, Math.min(14, xf.scale))
@@ -530,7 +526,6 @@ function FlatMapView({ filteredArcs, speedLevel }) {
     }
     draw()
     return () => {
-      // FIX: removed stale `fx` reference that caused ReferenceError on cleanup
       cancelAnimationFrame(rafRef.current)
       ro.disconnect()
       canvas.removeEventListener('mousedown',  onDown)
@@ -548,7 +543,18 @@ function FlatMapView({ filteredArcs, speedLevel }) {
   const resetZoom = ()  => { xfRef.current = { scale:1, tx:0, ty:0 } }
 
   return (
-    <div ref={containerRef} className="globe-container" style={{ position:'absolute', inset:0, overflow:'hidden' }}>
+    <div
+      ref={containerRef}
+      className="globe-container"
+      style={{
+        position: 'absolute', inset: 0, overflow: 'hidden',
+        // Visibility toggle: stays mounted, just hidden behind 3D globe
+        opacity:        visible ? 1 : 0,
+        pointerEvents:  visible ? 'auto' : 'none',
+        transition:     'opacity 0.25s ease',
+        zIndex:         visible ? 2 : 0,
+      }}
+    >
       <canvas ref={canvasRef} style={{ display:'block', width:'100%', height:'100%', cursor:'grab' }} />
       <div style={{ position:'absolute', bottom:58, right:12, display:'flex', flexDirection:'column', gap:4, zIndex:20 }}>
         {[{ l:'+', f:1.5 },{ l:'\u2212', f:1/1.5 },{ l:'\u2302', f:null }].map(({ l, f }) => (
@@ -571,7 +577,7 @@ function FlatMapView({ filteredArcs, speedLevel }) {
 // ═══════════════════════════════════════════════════════════════════════
 // 3-D GLOBE
 // ═══════════════════════════════════════════════════════════════════════
-function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
+function ThreeGlobe({ filteredArcs, isRotating, speedLevel, visible }) {
   const mountRef    = useRef(null)
   const refs        = useRef({})
   const speedRef    = useRef(speedLevel)
@@ -579,21 +585,23 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
 
   useEffect(() => { speedRef.current = speedLevel }, [speedLevel])
 
+  // Pause/resume RAF when hidden to save GPU
+  const pausedRef = useRef(false)
+  useEffect(() => { pausedRef.current = !visible }, [visible])
+
   useEffect(() => {
     const el = mountRef.current; if (!el) return
     const W = el.clientWidth || 800, H = el.clientHeight || 600
 
-    // FIX: alpha:false prevents transparent WebGL canvas from showing
-    // body/html background (the green #00ff88 variable) bleeding through
-    // when switching modes. setClearColor ensures canvas is always opaque.
-    const renderer = new THREE.WebGLRenderer({ antialias:true, alpha: false })
-    renderer.setClearColor(0x030a05, 1)  // matches --c-bg exactly
+    // alpha:false + setClearColor = opaque canvas, no green bleed-through
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false })
+    renderer.setClearColor(0x030a05, 1)   // matches --c-bg
     renderer.setSize(W, H)
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     el.appendChild(renderer.domElement)
 
     const scene  = new THREE.Scene()
-    scene.background = new THREE.Color(0x030a05)  // belt-and-suspenders: scene bg
+    scene.background = new THREE.Color(0x030a05) // belt-and-suspenders
 
     const camera = new THREE.PerspectiveCamera(45, W/H, .1, 100)
     camera.position.z = 2.5
@@ -645,6 +653,8 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     let rafId
     const animate = () => {
       rafId = requestAnimationFrame(animate)
+      // Skip heavy work when hidden, but keep RAF alive so no re-init needed
+      if (pausedRef.current) return
       controls.update()
 
       const camDist = camera.position.length()
@@ -747,13 +757,24 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     })
   }, [filteredArcs])
 
-  return <div ref={mountRef} className="globe-container" style={{ position:'relative', width:'100%', height:'100%' }} />
+  return (
+    <div
+      ref={mountRef}
+      className="globe-container"
+      style={{
+        position: 'absolute', inset: 0,
+        // Visibility toggle: stays mounted, just hidden behind flat map
+        opacity:       visible ? 1 : 0,
+        pointerEvents: visible ? 'auto' : 'none',
+        transition:    'opacity 0.25s ease',
+        zIndex:        visible ? 2 : 0,
+      }}
+    />
+  )
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// EXPORT — key prop forces full unmount/remount on mode switch
-// This is the correct fix for the green bg flash: the old WebGL canvas
-// is fully destroyed before the new component mounts.
+// EXPORT — both views always mounted, visibility toggled via CSS
 // ═══════════════════════════════════════════════════════════════════════
 export default function GlobeView() {
   const { globeView, heatmapActive, attacks, isRotating, speedLevel, selectedTypes, selectedSeverities } = useStore()
@@ -764,17 +785,39 @@ export default function GlobeView() {
     .filter(a => selectedTypes.includes(a.type) && selectedSeverities.includes(a.severity))
     .slice(0, 60)
 
-  if (globeView === 'flat' || !webglOk) return (
-    <div style={{ position:'relative', width:'100%', height:'100%' }}>
-      <FlatMapView key="flat" filteredArcs={filteredArcs} speedLevel={speedLevel} />
-      {!webglOk && <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-yellow-500/20 border border-yellow-500/40 text-yellow-300 text-xs px-3 py-1.5 rounded-lg">WebGL unavailable</div>}
-    </div>
-  )
+  const show3d   = webglOk && globeView !== 'flat'
+  const showFlat = globeView === 'flat' || !webglOk
 
   return (
-    <div style={{ position:'relative', width:'100%', height:'100%' }}>
-      <ThreeGlobe key="globe" filteredArcs={filteredArcs} isRotating={isRotating} speedLevel={speedLevel} />
-      {heatmapActive && <div className="absolute inset-0 pointer-events-none" style={{ background:'radial-gradient(ellipse at 35% 45%,rgba(0,60,200,.05) 0%,transparent 55%),radial-gradient(ellipse at 65% 55%,rgba(100,0,200,.04) 0%,transparent 50%)' }} />}
+    <div style={{ position:'relative', width:'100%', height:'100%', background:'#030a05', overflow:'hidden' }}>
+
+      {/* 3D Globe — always mounted when WebGL available, shown/hidden via opacity */}
+      {webglOk && (
+        <ThreeGlobe
+          filteredArcs={filteredArcs}
+          isRotating={isRotating}
+          speedLevel={speedLevel}
+          visible={show3d}
+        />
+      )}
+
+      {/* Flat Map — always mounted, shown/hidden via opacity */}
+      <FlatMapView
+        filteredArcs={filteredArcs}
+        speedLevel={speedLevel}
+        visible={showFlat}
+      />
+
+      {/* Heatmap overlay — only on 3D */}
+      {heatmapActive && show3d && (
+        <div className="absolute inset-0 pointer-events-none" style={{ background:'radial-gradient(ellipse at 35% 45%,rgba(0,60,200,.05) 0%,transparent 55%),radial-gradient(ellipse at 65% 55%,rgba(100,0,200,.04) 0%,transparent 50%)', zIndex:3 }} />
+      )}
+
+      {!webglOk && (
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-yellow-500/20 border border-yellow-500/40 text-yellow-300 text-xs px-3 py-1.5 rounded-lg" style={{ zIndex:10 }}>
+          WebGL unavailable
+        </div>
+      )}
     </div>
   )
 }
