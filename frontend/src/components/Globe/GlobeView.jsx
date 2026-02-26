@@ -148,7 +148,12 @@ function buildStars(scene) {
 //   At globe edge/limb:   dot≈0 → rim≈1 → alpha≈1 (bright glow)
 // ═══════════════════════════════════════════════════════════════════════
 function buildAtmosphere(scene) {
-  // ── 1. Original BackSide rim glow (UNCHANGED) ──────────────────────────
+  // ── Kaspersky-calibrated atmosphere ────────────────────────────────────
+  // Pixel analysis: Kaspersky peak green brightness at rim = ~58/255 (~23%)
+  // Glow is WIDE and SOFT (exponent ~2.0), NOT a bright ring.
+  // No separate FrontSide ring — BackSide + mist shells do everything.
+
+  // 1. BackSide diffuse halo (matches Kaspersky's subtle soft edge)
   const atmoMat = new THREE.ShaderMaterial({
     vertexShader: `
       varying vec3 vNormal;
@@ -165,9 +170,12 @@ function buildAtmosphere(scene) {
       void main() {
         vec3  viewDir = normalize(-vPosition);
         float rim     = 1.0 - abs(dot(viewDir, vNormal));
-        float glow    = pow(rim, 2.8);
-        vec3  color   = mix(vec3(0.0, 0.55, 0.22), vec3(0.0, 1.0, 0.45), glow);
-        float alpha   = clamp(glow * 1.15, 0.0, 0.90);
+        // exponent 2.0 = wider soft halo (not a thin ring)
+        float glow    = pow(rim, 2.0);
+        // Desaturated dark green, not bright neon
+        vec3  color   = mix(vec3(0.0, 0.28, 0.10), vec3(0.0, 0.60, 0.22), glow);
+        // Max alpha 0.20 — calibrated to Kaspersky 23% peak
+        float alpha   = clamp(glow * 0.55, 0.0, 0.20);
         gl_FragColor  = vec4(color, alpha);
       }
     `,
@@ -183,53 +191,15 @@ function buildAtmosphere(scene) {
   atmoMesh.renderOrder = 2
   scene.add(atmoMesh)
 
-  // ── 2. Kaspersky-style Limb Glow (tight FrontSide rim) ─────────────────
-  const glowMat = new THREE.ShaderMaterial({
-    uniforms: {
-      uColor:     { value: new THREE.Color('#00ff66') },
-      uIntensity: { value: 0.18 },
-    },
-    vertexShader: `
-      varying vec3 vNormal;
-      varying vec3 vViewPos;
-      void main() {
-        vNormal  = normalize(normalMatrix * normal);
-        vec4 mv  = modelViewMatrix * vec4(position, 1.0);
-        vViewPos = mv.xyz;
-        gl_Position = projectionMatrix * mv;
-      }
-    `,
-    fragmentShader: `
-      uniform vec3  uColor;
-      uniform float uIntensity;
-      varying vec3 vNormal;
-      varying vec3 vViewPos;
-      void main() {
-        vec3  viewDir = normalize(-vViewPos);
-        float rim = 1.0 - abs(dot(viewDir, normalize(vNormal)));
-        float g   = pow(rim, 8.0);
-        float a   = clamp(g * uIntensity, 0.0, 0.30);
-        gl_FragColor = vec4(uColor, a);
-      }
-    `,
-    transparent: true,
-    blending:    THREE.AdditiveBlending,
-    depthWrite:  false,
-    depthTest:   true,
-    side:        THREE.FrontSide,
-  })
-  const glowMesh = new THREE.Mesh(new THREE.SphereGeometry(1.04, 96, 96), glowMat)
-  glowMesh.renderOrder = 3
-  scene.add(glowMesh)
-
-  // ── 3. Kaspersky-style Evaporating Mist (2 shells) ─────────────────────
-  const makeMistMat = (seed) => new THREE.ShaderMaterial({
+  // 2. Evaporating mist shells (Kaspersky's "evaporating fog" above the globe)
+  // Two overlapping shells at different radii give the layered vapour look.
+  const makeMistMat = (seed, amount) => new THREE.ShaderMaterial({
     uniforms: {
       uTime:     { value: 0 },
       uSeed:     { value: seed },
-      uColor:    { value: new THREE.Color('#00ff66') },
-      uAmount:   { value: 0.09 },
-      uSoftness: { value: 1.2 },
+      uColor:    { value: new THREE.Color(0.0, 0.55, 0.18) },
+      uAmount:   { value: amount },
+      uSoftness: { value: 0.7 },   // wide base so mist fades far out
     },
     vertexShader: `
       varying vec3 vNormal;
@@ -267,13 +237,16 @@ function buildAtmosphere(scene) {
       void main() {
         vec3  viewDir = normalize(-vViewPos);
         float rim  = 1.0 - abs(dot(viewDir, normalize(vNormal)));
+        // Wide soft base — mist spreads far, not concentrated at ring
         float base = pow(rim, uSoftness);
 
-        vec3 p = normalize(vWorld) * 3.0;
-        p += vec3(uTime * 0.05, uTime * 0.03, -uTime * 0.04);
+        // World-space drifting noise = "evaporating" look
+        vec3 p = normalize(vWorld) * 2.5;
+        p += vec3(uTime * 0.04, uTime * 0.025, -uTime * 0.035);
         float n   = noise(p);
-        float fog = smoothstep(0.35, 0.92, n) * base;
-        float a   = clamp(fog * uAmount, 0.0, 0.11);
+        // Break up into wispy patches
+        float fog = smoothstep(0.40, 0.90, n) * base;
+        float a   = clamp(fog * uAmount, 0.0, 0.08);
         gl_FragColor = vec4(uColor, a);
       }
     `,
@@ -284,8 +257,11 @@ function buildAtmosphere(scene) {
     side:        THREE.FrontSide,
   })
 
-  const mist1 = new THREE.Mesh(new THREE.SphereGeometry(1.20, 96, 96), makeMistMat(1.3))
-  const mist2 = new THREE.Mesh(new THREE.SphereGeometry(1.32, 96, 96), makeMistMat(7.7))
+  // Inner mist (tighter, slightly brighter)
+  const mist1 = new THREE.Mesh(new THREE.SphereGeometry(1.15, 96, 96), makeMistMat(1.3,  0.07))
+  // Outer mist (wider spread, dimmer — the "vapour trails" look)
+  const mist2 = new THREE.Mesh(new THREE.SphereGeometry(1.40, 96, 96), makeMistMat(7.7,  0.05))
+
   mist1.renderOrder = 3
   mist2.renderOrder = 3
   scene.add(mist1, mist2)
@@ -662,7 +638,7 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
 
     buildStars(scene)          // renderOrder 0
     buildGlobe(scene)          // renderOrder 1 — writes depth first
-    const fx = buildAtmosphere(scene)  // BackSide glow + LimbGlow + Mist (renderOrder 2,3)
+    const fx = buildAtmosphere(scene)  // calibrated: BackSide halo + evaporating mist
     const labelObjects = buildLabels3D(scene)
     buildCountryBorders(scene) // renderOrder 3
 
@@ -748,7 +724,7 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
       spikesGrp.children.filter(s => s.userData.done).forEach(s => { s.geometry.dispose(); s.material.dispose(); spikesGrp.remove(s) })
       if (renderedRef.current.size > 600) renderedRef.current.clear()
 
-      // ── Kaspersky mist animation ──
+      // ── animate mist drift ──
       const _t = performance.now() * 0.001
       fx?.mistMats?.forEach(m => { m.uniforms.uTime.value = _t })
 
@@ -760,7 +736,6 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     refs.current = { scene, missilesGrp, trailsGrp, spikesGrp, controls, renderer, css2d, el }
     return () => {
       cancelAnimationFrame(rafId)
-      // Dispose mist/glow FX
       if (fx?.mistMats) fx.mistMats.forEach(m => m.dispose()); window.removeEventListener('resize', onResize)
       controls.dispose(); renderer.dispose()
       if (el.contains(renderer.domElement)) el.removeChild(renderer.domElement)
