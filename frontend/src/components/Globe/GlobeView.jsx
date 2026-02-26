@@ -171,74 +171,70 @@ function buildAtmosphere(scene) {
  *  • sorted big-first for collision priority
  */
 function buildLabels3D(scene) {
-  const DPR = 2  // render canvas at 2× for crispness
+  const DPR  = 2
+  const UP   = new THREE.Vector3(0, 1, 0)
   const items = []
 
   Object.entries(COUNTRIES).forEach(([code, { name, lat, lng }]) => {
     const mz     = MIN_ZOOM[code] ?? 3.5
     const isCity = CITY_KEYS.has(code)
 
-    // Font size in canvas pixels (×DPR)
-    const fPx = (mz <= 1.0 ? 22 : mz <= 1.5 ? 19 : mz <= 2.5 ? 16 : 13) * DPR
+    // Canvas texture
+    const fPx  = (mz <= 1.0 ? 22 : mz <= 1.5 ? 19 : mz <= 2.5 ? 16 : 13) * DPR
     const label = name.toUpperCase()
-
-    // Canvas size
-    const cW = Math.max(100, label.length * fPx * 0.58 + 20) * DPR
-    const cH = (fPx + 10) * DPR
-
-    const cv  = document.createElement('canvas')
-    cv.width  = cW
-    cv.height = cH
-    const cx  = cv.getContext('2d')
+    const cW   = Math.max(100, label.length * fPx * 0.60 + 24) * DPR
+    const cH   = (fPx + 14) * DPR
+    const cv   = document.createElement('canvas')
+    cv.width = cW; cv.height = cH
+    const cx = cv.getContext('2d')
     cx.clearRect(0, 0, cW, cH)
-
-    cx.font         = `400 ${fPx}px 'Courier New', monospace`
+    cx.font         = `600 ${fPx}px 'Courier New', monospace`
     cx.textAlign    = 'center'
     cx.textBaseline = 'middle'
-
-    // Dark halo for legibility
-    cx.shadowColor = 'rgba(0,0,0,0.95)'
-    cx.shadowBlur  = fPx * 0.4
-
-    // Colour per tier
-    const alpha = mz <= 1.0 ? 0.95 : mz <= 1.5 ? 0.88 : mz <= 2.5 ? 0.78 : 0.68
-    cx.fillStyle = isCity
-      ? `rgba(55,185,220,${alpha})`
-      : `rgba(70,220,130,${alpha})`
-
+    cx.shadowColor  = 'rgba(0,0,0,1)'
+    cx.shadowBlur   = fPx * 0.55
+    const alpha     = mz <= 1.0 ? 1.0 : mz <= 1.5 ? 0.92 : mz <= 2.5 ? 0.82 : 0.72
+    cx.fillStyle    = isCity
+      ? `rgba(55,195,230,${alpha})`
+      : `rgba(60,230,130,${alpha})`
     cx.fillText(label, cW / 2, cH / 2)
 
-    // ── Sprite ─────────────────────────────────────────────────────
-    const spr = new THREE.Sprite(
-      new THREE.SpriteMaterial({
-        map:         new THREE.CanvasTexture(cv),
+    // Plane mesh — NOT a Sprite, so no billboard/floating
+    const plW  = mz <= 1.0 ? 0.36 : mz <= 1.5 ? 0.28 : mz <= 2.5 ? 0.20 : 0.14
+    const mesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(plW, plW * (cH / cW)),
+      new THREE.MeshBasicMaterial({
+        map: new THREE.CanvasTexture(cv),
         transparent: true,
         depthWrite:  false,
-        depthTest:   false,   // always draw on top of globe surface
+        side:        THREE.DoubleSide,
       })
     )
 
-    // --- THE TWO KEY FIXES ---
-    // 1. Bottom-anchor: (0.5, 0) means the BOTTOM edge of the sprite sits
-    //    at spr.position. So the label base touches the country, not floats.
-    spr.center.set(0.5, 0)
+    // Place and orient the plane flat on the globe surface
+    const surfacePos = ll2v(lat, lng, R + 0.001)
+    mesh.position.copy(surfacePos)
 
-    // 2. Very small altitude so position is right on the surface
-    spr.position.copy(ll2v(lat, lng, R + 0.006))
+    const normal = surfacePos.clone().normalize()
+    let tangentUp = UP.clone()
+    if (Math.abs(normal.dot(UP)) > 0.98) tangentUp.set(0, 0, 1)
+    const tangentRight = new THREE.Vector3()
+      .crossVectors(normal, tangentUp).normalize()
+    tangentUp = new THREE.Vector3()
+      .crossVectors(tangentRight, normal).normalize()
 
-    // World-space scale — wider aspect to match canvas ratio
-    const scW = mz <= 1.0 ? 0.38 : mz <= 1.5 ? 0.30 : mz <= 2.5 ? 0.22 : 0.16
-    spr.scale.set(scW, scW * (cH / cW), 1)
+    mesh.setRotationFromMatrix(
+      new THREE.Matrix4().makeBasis(tangentRight, tangentUp, normal)
+    )
 
-    spr.userData = { mz, maxDist: maxDistFor(mz) }
-    spr.visible  = false
-    scene.add(spr)
-    items.push({ spr, mz })
+    mesh.userData = { mz, maxDist: maxDistFor(mz) }
+    mesh.visible  = false
+    scene.add(mesh)
+    items.push({ mesh, mz })
   })
 
-  // Big countries first → win screen-space collision checks
   items.sort((a, b) => a.mz - b.mz)
-  return items.map(i => i.spr)
+  return items.map(i => i.mesh)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -550,7 +546,7 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     buildStars(scene)
     buildGlobe(scene)
     buildAtmosphere(scene)
-    const labelSprites = buildLabels3D(scene)   // sorted big-first
+    const labelMeshes = buildLabels3D(scene)   // sorted big-first //Also changed from labelSprites to labelMeshes
     buildCountryBorders(scene)
 
     const missilesGrp = new THREE.Group(), trailsGrp = new THREE.Group(), spikesGrp = new THREE.Group()
@@ -575,40 +571,12 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
       // ── Per-frame screen-space collision cull ─────────────────────
       const screenBoxes = []
 
-      labelSprites.forEach(spr => {
-        const ud = spr.userData
-
-        // 1. Distance gate
-        if (camDist > ud.maxDist) { spr.visible = false; return }
-
-        // 2. Back-face cull
-        const sprDir = spr.position.clone().normalize()
-        if (sprDir.dot(camNorm) < 0.12) { spr.visible = false; return }
-
-        // 3. Project to NDC
-        _ndc.copy(spr.position)
-        _ndc.project(camera)
-        const nx = _ndc.x, ny = _ndc.y
-        if (nx < -1.1 || nx > 1.1 || ny < -1.1 || ny > 1.1) { spr.visible = false; return }
-
-        // 4. Estimated screen half-extents
-        const halfW = (spr.scale.x / camDist) * (1.8 / camera.aspect)
-        const halfH = (spr.scale.y / camDist) * 1.8
-
-        // 5. Collision check
-        let blocked = false
-        for (const b of screenBoxes) {
-          const pad = 0.035
-          if (nx - halfW - pad < b.x + b.hw &&
-              nx + halfW + pad > b.x - b.hw &&
-              ny - halfH - pad < b.y + b.hh &&
-              ny + halfH + pad > b.y - b.hh) { blocked = true; break }
-        }
-        if (blocked) { spr.visible = false; return }
-
-        screenBoxes.push({ x: nx, y: ny, hw: halfW, hh: halfH })
-        spr.visible = true
-      })
+      labelMeshes.forEach(mesh => {
+         const ud = mesh.userData
+          if (camDist > ud.maxDist) { mesh.visible = false; return }
+          const surfDir = mesh.position.clone().normalize()
+          mesh.visible = surfDir.dot(camNorm) > 0.15
+       })
 
       // ── Missiles ──────────────────────────────────────────────────
       const spd = SPD3D[speedRef.current] ?? SPD3D[1]
