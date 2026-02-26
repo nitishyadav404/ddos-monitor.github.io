@@ -1,10 +1,17 @@
 /**
  * GlobeView.jsx — 3D Globe + 2D Flat Map
  *
- * Atmosphere: FrontSide shell at 1.5R.
- * Glow is MAXIMUM at the globe circumference edge (rim=1),
- * then linearly fades outward into space (rim->0 = fully transparent).
- * 100Lu → 80 → 60 → 40 → 20 → 10 → 0Lu as described.
+ * Atmosphere: BackSide shell at exactly 1.0R (globe surface).
+ *
+ * HOW THE GLOW WORKS:
+ *   BackSide = we see the INNER face of the shell.
+ *   At the silhouette edge the inner normal is perpendicular to the view
+ *   → ndotv = 0 → rim = 1 → alpha = 1.0  (100 Lu, MAX at circumference)
+ *   Toward the "top" of the shell (facing camera directly)
+ *   → ndotv = 1 → rim = 0 → alpha = 0.0  (0 Lu, fully transparent in space)
+ *
+ *   Result: Glow starts at the EXACT globe edge and fades OUTWARD into space.
+ *   100 Lu → 80 → 60 → 40 → 20 → 10 → 0 Lu  ✓
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
@@ -145,20 +152,21 @@ async function buildCountryBorders(scene) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// ATMOSPHERE — FrontSide shell at 1.5R
+// ATMOSPHERE — BackSide shell at exactly R (globe surface radius)
 //
-// KEY INSIGHT: FrontSide means fragments face the camera.
-// rim = 1 - |dot(normal, viewDir)|
-//   rim ≈ 1  → grazing angle = the silhouette EDGE (globe circumference)
-//   rim ≈ 0  → face-on = the middle of the disc (pointing away into space)
+// BackSide: we render the INNER face of the sphere.
+// The inner face normal points INWARD (toward globe centre).
+// When projected to view space:
+//   ndotv = dot(inner_normal, viewDir)
+//   At the silhouette ring → inner normal ⊥ viewDir → ndotv ≈ 0
+//   Directly behind globe  → inner normal ∥ viewDir → ndotv ≈ 1
 //
-// So:  alpha = pow(rim, N)  gives MAX brightness at the edge (rim=1)
-//      and fades to 0 toward the centre of the shell face.
-// With FrontSide, the centre of the shell faces space → it's transparent.
-// The circumference ring (rim=1) is fully bright → 100 Lu.
-// Everything in between fades: 100→80→60→40→20→10→0.
+// We want MAX glow at the silhouette (circumference), zero elsewhere:
+//   rim = 1.0 - ndotv   → 1 at silhouette edge, 0 at pole
+//   alpha = pow(rim, N) → bright ring at edge, fades outward into space ✓
 //
-// No BackSide needed. No double ring. One clean halo exactly at the edge.
+// The shell radius is 1.18R — just enough to peek around the globe edge
+// and project the halo outward into space without overlapping the surface.
 // ═══════════════════════════════════════════════════════════════════════
 const ATMO_VERT = /* glsl */`
   varying vec3 vWorldPos;
@@ -203,36 +211,41 @@ const ATMO_FRAG = /* glsl */`
   }
 
   void main() {
-    // rim: 1.0 = silhouette edge (globe circumference), 0.0 = disc centre
+    // ndotv: 0 = silhouette edge of shell, 1 = pole facing camera
     float ndotv = abs(dot(vNormal, vViewDir));
-    float rim   = 1.0 - ndotv;          // 1 at edge, 0 at face-on
-    rim         = clamp(rim, 0.0, 1.0);
 
-    // ── GLOW: 100% at rim=1, decays to 0 outward ─────────────────
-    // pow(rim, 3.5): tight sharp band at circumference
-    // multiply by rim itself for extra falloff control
-    float glow  = pow(rim, 3.5);         // peak at edge, steep falloff
-    float alpha = glow * 0.90;           // max ~90% opacity at the exact edge
+    // rim: 1 at silhouette edge (globe circumference) → MAX glow here
+    //      0 at pole (facing space directly)          → transparent
+    float rim = 1.0 - ndotv;
+    rim = clamp(rim, 0.0, 1.0);
 
-    // ── WISPY MIST: only in tight edge band ──────────────────────
-    // rimGate: zero below rim 0.65, ramps to 1 at rim 0.85
-    float rimGate = smoothstep(0.65, 0.88, rim);
-    vec3  p1 = vWorldPos * 2.6 + vec3( uTime*0.055,  uTime*0.040, -uTime*0.030);
-    vec3  p2 = vWorldPos * 5.0 + vec3(-uTime*0.095,  uTime*0.075,  uTime*0.050);
-    float n   = fbm(p1) + fbm(p2) * 0.45;
-    float mist = smoothstep(0.50, 1.0, n) * rimGate * 0.25;
+    // ── BASE GLOW: peaks at rim=1 (circumference), decays outward ──
+    // pow exponent controls width of the halo band:
+    //   low  (1.5) = wide  soft halo
+    //   high (6.0) = tight thin ring
+    // 2.5 gives a natural atmospheric width, like Kaspersky
+    float glow  = pow(rim, 2.5);
+    float alpha = glow * 0.88;
 
-    // ── COMBINE ───────────────────────────────────────────────────
+    // ── ANIMATED WISPY MIST — only near the silhouette band ────────
+    // Gate: only visible when rim > 0.55, peaks at rim > 0.75
+    float rimGate = smoothstep(0.55, 0.78, rim);
+    vec3  p1 = vWorldPos * 2.8 + vec3( uTime*0.055,  uTime*0.038, -uTime*0.028);
+    vec3  p2 = vWorldPos * 5.2 + vec3(-uTime*0.092,  uTime*0.070,  uTime*0.048);
+    float n   = fbm(p1) + fbm(p2) * 0.42;
+    float mist = smoothstep(0.48, 1.0, n) * rimGate * 0.28;
+
+    // ── COMBINE ─────────────────────────────────────────────────────
     float finalAlpha = alpha + mist;
     if (finalAlpha < 0.004) discard;
-    finalAlpha = min(finalAlpha, 0.95);
+    finalAlpha = min(finalAlpha, 0.94);
 
-    // Colour: bright cyber-green at edge, deeper green further out
-    vec3 edgeCol = vec3(0.10, 1.00, 0.45);   // bright at rim=1
-    vec3 fadeCol = vec3(0.00, 0.35, 0.14);   // deep at rim=0
+    // Colour: bright cyber-green at circumference edge (rim=1)
+    //         deep dark green toward space (rim=0)
+    vec3 edgeCol = vec3(0.08, 1.00, 0.42);  // full bright at globe edge
+    vec3 fadeCol = vec3(0.00, 0.28, 0.10);  // near-black far from globe
     vec3 col     = mix(fadeCol, edgeCol, glow);
-    // mist wisps slightly brighter
-    col = mix(col, vec3(0.15, 1.0, 0.55), mist / max(finalAlpha, 0.001));
+    col = mix(col, vec3(0.12, 1.0, 0.52), mist / max(finalAlpha, 0.001));
 
     gl_FragColor = vec4(col, finalAlpha);
   }
@@ -243,15 +256,19 @@ function buildAtmosphere(scene) {
     uniforms:      { uTime: { value: 0.0 } },
     vertexShader:   ATMO_VERT,
     fragmentShader: ATMO_FRAG,
-    side:        THREE.FrontSide,       // FrontSide: rim=1 IS the silhouette edge
+    // BackSide: renders inner face of sphere
+    // The inner normals point inward — at the silhouette ring they are
+    // perpendicular to the view ray, giving rim=1 (max glow) at the
+    // exact globe circumference. The halo fans outward from there.
+    side:        THREE.BackSide,
     blending:    THREE.AdditiveBlending,
     transparent: true,
     depthWrite:  false,
-    depthTest:   false,                 // render on top of globe, no z-fighting
+    depthTest:   false,
   })
-  // Shell sits just outside the globe surface — the visible ring
-  // is exactly at the circumference, haze fans outward from there.
-  scene.add(new THREE.Mesh(new THREE.SphereGeometry(R * 1.5, 64, 64), mat))
+  // 1.18R: shell slightly larger than globe so the halo is visible
+  // around the silhouette without clipping into the surface
+  scene.add(new THREE.Mesh(new THREE.SphereGeometry(R * 1.18, 64, 64), mat))
   return mat
 }
 
@@ -583,7 +600,7 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
 
     buildStars(scene)
     buildGlobe(scene)
-    const atmoMat = buildAtmosphere(scene)  // single FrontSide shell
+    const atmoMat = buildAtmosphere(scene)
     const labelObjects = buildLabels3D(scene)
     buildCountryBorders(scene)
 
