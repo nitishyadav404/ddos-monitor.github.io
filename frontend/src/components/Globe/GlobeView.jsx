@@ -1,23 +1,13 @@
 /**
- * GlobeView.jsx
+ * GlobeView.jsx — 3D Globe + 2D Flat Map
  *
- * 3D Globe label fix:
- *   - Per-frame screen-space AABB collision detection for s.
- *     Each frame, every visible  is projected to NDC coords;
- *     if its screen box overlaps a higher-priority (bigger country)
- *     already-accepted  it is hidden for that frame.
- *   - maxDist thresholds tightened per size group using MIN_ZOOM:
- *       giant   → always (Infinity)
- *       large   → 2.4
- *       medium  → 1.9
- *       small   → 1.55
- *       tiny    → 1.38
- *       cities  → 1.28
- *   - s sorted by priority (big country first) so large nations
- *     always win the collision check against small neighbours.
- *   - Thinner 500-weight font, smaller canvas, no bold globs.
- *
- * 2D map unchanged (already fixed in previous commit).
+ * 3D label fixes in this file:
+ *  1. THREE.Sprite / THREE.SpriteMaterial restored (were corrupted).
+ *  2. Altitude dropped from R+0.055 → R+0.006 so labels sit ON the globe.
+ *  3. spr.center.set(0.5, 0) — bottom-anchors the sprite so the label
+ *     base touches the lat/lng point rather than floating above it.
+ *  4. Canvas resolution doubled (×2 devicePixelRatio trick) for crispness.
+ *  5. Per-frame NDC collision cull unchanged (big-countries-first).
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
@@ -30,8 +20,8 @@ const R        = 1.0
 const SEGMENTS = 80
 const TOPO_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json'
 
-// ── Size bucket for every country code ───────────────────────────────────
-// minZoom doubles as priority — smaller value = bigger country = higher priority
+// ── Size-bucket / priority table ─────────────────────────────────────────
+// Lower value = bigger country = higher label priority
 const MIN_ZOOM = {
   US:1.0,CN:1.0,RU:1.0,CA:1.0,BR:1.0,AU:1.0,IN:1.0,
   DZ:1.0,KZ:1.0,SA:1.0,AR:1.0,MX:1.0,ID:1.0,LY:1.0,
@@ -66,644 +56,673 @@ const MIN_ZOOM = {
   LHR:6.0,FRA:6.0,CDG:6.0,
 }
 
-const CITY_KEYS = new Set(Object.keys(MIN_ZOOM).filter(k=>MIN_ZOOM[k]>=6.0))
+const CITY_KEYS = new Set(Object.keys(MIN_ZOOM).filter(k => MIN_ZOOM[k] >= 6.0))
 
-// Camera distance at which each size group becomes eligible to show on globe
-// (minDistance from globe surface; globe radius = 1, camera starts at z=2.5)
-function maxDistFor(mz){
-  if(mz<=1.0) return Infinity  // giant  — always
-  if(mz<=1.5) return 2.4       // large
-  if(mz<=2.5) return 1.9       // medium
-  if(mz<=3.5) return 1.58      // small
-  if(mz<=5.0) return 1.40      // tiny
-  return 1.28                   // cities
+function maxDistFor(mz) {
+  if (mz <= 1.0) return Infinity
+  if (mz <= 1.5) return 2.4
+  if (mz <= 2.5) return 1.9
+  if (mz <= 3.5) return 1.58
+  if (mz <= 5.0) return 1.40
+  return 1.28
 }
 
-function ll2v(lat,lng,r=R){
-  const phi  =(90-lat)*(Math.PI/180)
-  const theta=(lng+180)*(Math.PI/180)
+function ll2v(lat, lng, r = R) {
+  const phi   = (90 - lat)  * (Math.PI / 180)
+  const theta = (lng + 180) * (Math.PI / 180)
   return new THREE.Vector3(
-    -r*Math.sin(phi)*Math.cos(theta),
-     r*Math.cos(phi),
-     r*Math.sin(phi)*Math.sin(theta),
+    -r * Math.sin(phi) * Math.cos(theta),
+     r * Math.cos(phi),
+     r * Math.sin(phi) * Math.sin(theta),
   )
 }
 
-function arcPoints(arc){
-  const src=ll2v(arc.sourceLat,arc.sourceLng)
-  const tgt=ll2v(arc.targetLat,arc.targetLng)
-  const alt=arc.severity==='critical'?0.55:arc.severity==='high'?0.45:0.36
-  const mid=src.clone().add(tgt).normalize().multiplyScalar(R*(1+alt))
-  return new THREE.QuadraticBezierCurve3(src,mid,tgt).getPoints(SEGMENTS)
+function arcPoints(arc) {
+  const src = ll2v(arc.sourceLat, arc.sourceLng)
+  const tgt = ll2v(arc.targetLat, arc.targetLng)
+  const alt = arc.severity === 'critical' ? 0.55 : arc.severity === 'high' ? 0.45 : 0.36
+  const mid = src.clone().add(tgt).normalize().multiplyScalar(R * (1 + alt))
+  return new THREE.QuadraticBezierCurve3(src, mid, tgt).getPoints(SEGMENTS)
 }
 
-const SPD3D=[0.003,0.008,0.018,0.042]
-const SPD2D=[0.003,0.008,0.018,0.042]
+const SPD3D = [0.003, 0.008, 0.018, 0.042]
+const SPD2D = [0.003, 0.008, 0.018, 0.042]
 
-let _topoCache=null
-async function getTopoFeatures(){
-  if(_topoCache)return _topoCache
-  const res=await fetch(TOPO_URL)
-  const world=await res.json()
-  _topoCache=topojson.feature(world,world.objects.countries).features
+let _topoCache = null
+async function getTopoFeatures() {
+  if (_topoCache) return _topoCache
+  const res   = await fetch(TOPO_URL)
+  const world = await res.json()
+  _topoCache  = topojson.feature(world, world.objects.countries).features
   return _topoCache
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// 3D helpers
-// ─────────────────────────────────────────────────────────────────────
-function buildStars(scene){
-  const N=8000,pos=new Float32Array(N*3),sz=new Float32Array(N)
-  for(let i=0;i<N;i++){
-    const t=2*Math.PI*Math.random(),p=Math.acos(2*Math.random()-1),r=14+Math.random()*36
-    pos[i*3]=r*Math.sin(p)*Math.cos(t)
-    pos[i*3+1]=r*Math.sin(p)*Math.sin(t)
-    pos[i*3+2]=r*Math.cos(p)
-    sz[i]=Math.random()<.07?2:Math.random()<.2?1.1:.5
+// ─────────────────────────────────────────────────────────────────────────
+// 3D scene helpers
+// ─────────────────────────────────────────────────────────────────────────
+function buildStars(scene) {
+  const N = 8000, pos = new Float32Array(N * 3), sz = new Float32Array(N)
+  for (let i = 0; i < N; i++) {
+    const t = 2 * Math.PI * Math.random(), p = Math.acos(2 * Math.random() - 1), r = 14 + Math.random() * 36
+    pos[i*3]   = r * Math.sin(p) * Math.cos(t)
+    pos[i*3+1] = r * Math.sin(p) * Math.sin(t)
+    pos[i*3+2] = r * Math.cos(p)
+    sz[i] = Math.random() < .07 ? 2 : Math.random() < .2 ? 1.1 : .5
   }
-  const g=new THREE.BufferGeometry()
-  g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3))
-  g.setAttribute('aSize',new THREE.Float32BufferAttribute(sz,1))
-  scene.add(new THREE.Points(g,new THREE.ShaderMaterial({
-    vertexShader:`attribute float aSize;void main(){vec4 mv=modelViewMatrix*vec4(position,1.);gl_PointSize=aSize*(280./-mv.z);gl_Position=projectionMatrix*mv;}`,
-    fragmentShader:`void main(){float d=length(gl_PointCoord-.5)*2.;if(d>1.)discard;gl_FragColor=vec4(1.,1.,1.,(1.-smoothstep(0.,1.,d))*.82);}`,
-    transparent:true,blending:THREE.AdditiveBlending,depthWrite:false,
+  const g = new THREE.BufferGeometry()
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3))
+  g.setAttribute('aSize',    new THREE.Float32BufferAttribute(sz,  1))
+  scene.add(new THREE.Points(g, new THREE.ShaderMaterial({
+    vertexShader:   `attribute float aSize;void main(){vec4 mv=modelViewMatrix*vec4(position,1.);gl_PointSize=aSize*(280./-mv.z);gl_Position=projectionMatrix*mv;}`,
+    fragmentShader: `void main(){float d=length(gl_PointCoord-.5)*2.;if(d>1.)discard;gl_FragColor=vec4(1.,1.,1.,(1.-smoothstep(0.,1.,d))*.82);}`,
+    transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
   })))
 }
 
-function buildGlobe(scene){
-  const L=new THREE.TextureLoader()
+function buildGlobe(scene) {
+  const L = new THREE.TextureLoader()
   scene.add(new THREE.Mesh(
-    new THREE.SphereGeometry(R,64,64),
+    new THREE.SphereGeometry(R, 64, 64),
     new THREE.MeshPhongMaterial({
-      map:        L.load('https://unpkg.com/three-globe@2.27.3/example/img/earth-dark.jpg'),
-      specularMap:L.load('https://unpkg.com/three-globe@2.27.3/example/img/earth-water.png'),
-      bumpMap:    L.load('https://unpkg.com/three-globe@2.27.3/example/img/earth-topology.png'),
-      bumpScale:.01,specular:new THREE.Color(0x1a3344),shininess:6,
+      map:         L.load('https://unpkg.com/three-globe@2.27.3/example/img/earth-dark.jpg'),
+      specularMap: L.load('https://unpkg.com/three-globe@2.27.3/example/img/earth-water.png'),
+      bumpMap:     L.load('https://unpkg.com/three-globe@2.27.3/example/img/earth-topology.png'),
+      bumpScale: .01, specular: new THREE.Color(0x1a3344), shininess: 6,
     })
   ))
 }
 
-async function buildCountryBorders(scene){
-  try{
-    const features=await getTopoFeatures()
-    const mat=new THREE.LineBasicMaterial({color:0x3a6045,transparent:true,opacity:.7})
-    features.forEach(f=>{
-      if(!f.geometry)return
-      const drawRing=ring=>{
-        if(ring.length<2)return
-        const pts=ring.map(([lng,lat])=>ll2v(lat,lng,R+.0015))
-        if(!pts[0].equals(pts[pts.length-1]))pts.push(pts[0].clone())
-        scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),mat))
+async function buildCountryBorders(scene) {
+  try {
+    const features = await getTopoFeatures()
+    const mat = new THREE.LineBasicMaterial({ color: 0x3a6045, transparent: true, opacity: .7 })
+    features.forEach(f => {
+      if (!f.geometry) return
+      const drawRing = ring => {
+        if (ring.length < 2) return
+        const pts = ring.map(([lng, lat]) => ll2v(lat, lng, R + .0015))
+        if (!pts[0].equals(pts[pts.length - 1])) pts.push(pts[0].clone())
+        scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat))
       }
-      if(f.geometry.type==='Polygon')f.geometry.coordinates.forEach(drawRing)
-      else if(f.geometry.type==='MultiPolygon')f.geometry.coordinates.forEach(p=>p.forEach(drawRing))
+      if (f.geometry.type === 'Polygon')      f.geometry.coordinates.forEach(drawRing)
+      else if (f.geometry.type === 'MultiPolygon') f.geometry.coordinates.forEach(p => p.forEach(drawRing))
     })
-  }catch(e){console.warn('3D borders:',e)}
+  } catch(e) { console.warn('3D borders:', e) }
 }
 
-function buildAtmosphere(scene){
+function buildAtmosphere(scene) {
   scene.add(new THREE.Mesh(
-    new THREE.SphereGeometry(R*1.012,64,64),
+    new THREE.SphereGeometry(R * 1.012, 64, 64),
     new THREE.ShaderMaterial({
-      uniforms:{c:{value:new THREE.Color(0x33dd66)}},
-      vertexShader:`varying float vI;void main(){vec3 n=normalize(normalMatrix*normal);vec3 v=normalize(-(modelViewMatrix*vec4(position,1.)).xyz);vI=pow(max(0.,1.-dot(n,v)),5.);gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
-      fragmentShader:`uniform vec3 c;varying float vI;void main(){gl_FragColor=vec4(c,vI*.18);}`,
-      side:THREE.FrontSide,blending:THREE.AdditiveBlending,transparent:true,depthWrite:false,
+      uniforms: { c: { value: new THREE.Color(0x33dd66) } },
+      vertexShader:   `varying float vI;void main(){vec3 n=normalize(normalMatrix*normal);vec3 v=normalize(-(modelViewMatrix*vec4(position,1.)).xyz);vI=pow(max(0.,1.-dot(n,v)),5.);gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
+      fragmentShader: `uniform vec3 c;varying float vI;void main(){gl_FragColor=vec4(c,vI*.18);}`,
+      side: THREE.FrontSide, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false,
     })
   ))
 }
 
 /**
- * Build s for every country in COUNTRIES.
- * Returns array sorted by priority (big countries first) so that
- * the per-frame collision loop always keeps large nations visible.
+ * buildLabels3D — key fixes vs previous broken version:
+ *  • THREE.Sprite / THREE.SpriteMaterial used correctly
+ *  • spr.center.set(0.5, 0)  ← bottom-anchor: base of text = lat/lng point
+ *  • altitude = R + 0.006    ← nearly touching the surface (was 0.055)
+ *  • canvas drawn at 2× then downscaled for crisp texture
+ *  • sorted big-first for collision priority
  */
-function buildLabels3D(scene){
-  const items=[]  // {spr, mz}
+function buildLabels3D(scene) {
+  const DPR = 2  // render canvas at 2× for crispness
+  const items = []
 
-  Object.entries(COUNTRIES).forEach(([code,{name,lat,lng}])=>{
-    const mz=MIN_ZOOM[code]??3.5
-    const isCity=CITY_KEYS.has(code)
+  Object.entries(COUNTRIES).forEach(([code, { name, lat, lng }]) => {
+    const mz     = MIN_ZOOM[code] ?? 3.5
+    const isCity = CITY_KEYS.has(code)
 
-    // Canvas / font sizing based on size group
-    const fSize=mz<=1.0?10:mz<=1.5?9:mz<=2.5?8:7
-    const label=name
-    const W=Math.max(70,label.length*fSize*0.62+16)
-    const H=fSize+8
+    // Font size in canvas pixels (×DPR)
+    const fPx = (mz <= 1.0 ? 22 : mz <= 1.5 ? 19 : mz <= 2.5 ? 16 : 13) * DPR
+    const label = name.toUpperCase()
 
-    const cv=Object.assign(document.createElement('canvas'),{width:W,height:H})
-    const cx=cv.getContext('2d')
-    cx.clearRect(0,0,W,H)
-    cx.font=`500 ${fSize}px monospace`
-    cx.textAlign='center';cx.textBaseline='middle'
+    // Canvas size
+    const cW = Math.max(100, label.length * fPx * 0.58 + 20) * DPR
+    const cH = (fPx + 10) * DPR
 
-    // Colour: bright for giant, dimmer for smaller
-    const alpha=mz<=1.0?0.92:mz<=1.5?0.82:mz<=2.5?0.72:0.62
-    cx.fillStyle=isCity
-      ?`rgba(60,185,215,${alpha})`
-      :`rgba(80,215,135,${alpha})`
-    cx.shadowColor='rgba(0,0,0,0.85)'
-    cx.shadowBlur=mz<=1.5?5:3
-    cx.fillText(label,W/2,H/2)
+    const cv  = document.createElement('canvas')
+    cv.width  = cW
+    cv.height = cH
+    const cx  = cv.getContext('2d')
+    cx.clearRect(0, 0, cW, cH)
 
-    const spr=new THREE.(new THREE.Material({
-      map:new THREE.CanvasTexture(cv),
-      transparent:true,depthWrite:false,
-    }))
-    // Smaller altitude so the name “sticks” close to the surface 
-    const alt = isCity ? 0.012 : 0.015
-    spr.position.copy(ll2v(lat, lng, R + alt))
+    cx.font         = `400 ${fPx}px 'Courier New', monospace`
+    cx.textAlign    = 'center'
+    cx.textBaseline = 'middle'
 
-    // World-space  scale: bigger for large countries
-    const sc=mz<=1.0?0.36:mz<=1.5?0.30:mz<=2.5?0.22:0.17
-    spr.scale.set(sc,sc*(H/W),1)
+    // Dark halo for legibility
+    cx.shadowColor = 'rgba(0,0,0,0.95)'
+    cx.shadowBlur  = fPx * 0.4
 
-    // maxDist = camera distance at which this sprite becomes eligible
-    spr.userData={
-      mz,
-      maxDist:maxDistFor(mz),
-      // screen-space half-extents in NDC (updated each frame)
-      ndcHW:0, ndcHH:0,
-    }
-    spr.visible=false
+    // Colour per tier
+    const alpha = mz <= 1.0 ? 0.95 : mz <= 1.5 ? 0.88 : mz <= 2.5 ? 0.78 : 0.68
+    cx.fillStyle = isCity
+      ? `rgba(55,185,220,${alpha})`
+      : `rgba(70,220,130,${alpha})`
+
+    cx.fillText(label, cW / 2, cH / 2)
+
+    // ── Sprite ─────────────────────────────────────────────────────
+    const spr = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map:         new THREE.CanvasTexture(cv),
+        transparent: true,
+        depthWrite:  false,
+        depthTest:   false,   // always draw on top of globe surface
+      })
+    )
+
+    // --- THE TWO KEY FIXES ---
+    // 1. Bottom-anchor: (0.5, 0) means the BOTTOM edge of the sprite sits
+    //    at spr.position. So the label base touches the country, not floats.
+    spr.center.set(0.5, 0)
+
+    // 2. Very small altitude so position is right on the surface
+    spr.position.copy(ll2v(lat, lng, R + 0.006))
+
+    // World-space scale — wider aspect to match canvas ratio
+    const scW = mz <= 1.0 ? 0.38 : mz <= 1.5 ? 0.30 : mz <= 2.5 ? 0.22 : 0.16
+    spr.scale.set(scW, scW * (cH / cW), 1)
+
+    spr.userData = { mz, maxDist: maxDistFor(mz) }
+    spr.visible  = false
     scene.add(spr)
-    items.push({spr,mz})
+    items.push({ spr, mz })
   })
 
-  // Sort big countries first — they win collision priority
-  items.sort((a,b)=>a.mz-b.mz)
-  return items.map(i=>i.spr)
+  // Big countries first → win screen-space collision checks
+  items.sort((a, b) => a.mz - b.mz)
+  return items.map(i => i.spr)
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 // FLAT 2-D MAP
-// ═══════════════════════════════════════════════════════════════════
-function FlatMapView({filteredArcs,speedLevel}){
-  const containerRef    =useRef(null)
-  const canvasRef       =useRef(null)
-  const speedRef        =useRef(speedLevel)
-  const filteredArcsRef =useRef(filteredArcs)
-  const arcStates       =useRef({})
-  const rafRef          =useRef(null)
-  const countriesRef    =useRef(null)
-  const xfRef           =useRef({scale:1,tx:0,ty:0})
-  const dragRef         =useRef(null)
-  const pinchRef        =useRef(null)
-  const dimRef          =useRef({W:0,H:0})
+// ═══════════════════════════════════════════════════════════════════════
+function FlatMapView({ filteredArcs, speedLevel }) {
+  const containerRef    = useRef(null)
+  const canvasRef       = useRef(null)
+  const speedRef        = useRef(speedLevel)
+  const filteredArcsRef = useRef(filteredArcs)
+  const arcStates       = useRef({})
+  const rafRef          = useRef(null)
+  const countriesRef    = useRef(null)
+  const xfRef           = useRef({ scale: 1, tx: 0, ty: 0 })
+  const dragRef         = useRef(null)
+  const pinchRef        = useRef(null)
+  const dimRef          = useRef({ W: 0, H: 0 })
 
-  useEffect(()=>{speedRef.current=speedLevel},[speedLevel])
-  useEffect(()=>{filteredArcsRef.current=filteredArcs},[filteredArcs])
-  useEffect(()=>{getTopoFeatures().then(f=>{countriesRef.current=f}).catch(console.warn)},[])
+  useEffect(() => { speedRef.current = speedLevel }, [speedLevel])
+  useEffect(() => { filteredArcsRef.current = filteredArcs }, [filteredArcs])
+  useEffect(() => { getTopoFeatures().then(f => { countriesRef.current = f }).catch(console.warn) }, [])
 
-  const clampXf=(xf,W,H)=>{
-    const s=Math.max(1,Math.min(14,xf.scale))
-    return{scale:s,tx:Math.max(-(W*(s-1)),Math.min(0,xf.tx)),ty:Math.max(-(H*(s-1)),Math.min(0,xf.ty))}
+  const clampXf = (xf, W, H) => {
+    const s = Math.max(1, Math.min(14, xf.scale))
+    return { scale: s, tx: Math.max(-(W*(s-1)), Math.min(0, xf.tx)), ty: Math.max(-(H*(s-1)), Math.min(0, xf.ty)) }
   }
-  const zoomAt=(cx,cy,factor)=>{
-    const{W,H}=dimRef.current
-    const xf=xfRef.current
-    const ns=Math.max(1,Math.min(14,xf.scale*factor))
-    const r=ns/xf.scale
-    xfRef.current=clampXf({scale:ns,tx:cx-r*(cx-xf.tx),ty:cy-r*(cy-xf.ty)},W,H)
+  const zoomAt = (cx, cy, factor) => {
+    const { W, H } = dimRef.current
+    const xf = xfRef.current
+    const ns = Math.max(1, Math.min(14, xf.scale * factor))
+    const r  = ns / xf.scale
+    xfRef.current = clampXf({ scale: ns, tx: cx - r*(cx - xf.tx), ty: cy - r*(cy - xf.ty) }, W, H)
   }
 
-  useEffect(()=>{
-    const container=containerRef.current,canvas=canvasRef.current
-    if(!container||!canvas)return
-    const ctx=canvas.getContext('2d')
+  useEffect(() => {
+    const container = containerRef.current, canvas = canvasRef.current
+    if (!container || !canvas) return
+    const ctx = canvas.getContext('2d')
 
-    const setSize=()=>{
-      const r=container.getBoundingClientRect()
-      const nw=Math.floor(r.width)||800,nh=Math.floor(r.height)||600
-      const{W,H}=dimRef.current
-      if(nw===W&&nh===H)return
-      dimRef.current={W:nw,H:nh}
-      canvas.width=nw;canvas.height=nh
-      xfRef.current=clampXf(xfRef.current,nw,nh)
+    const setSize = () => {
+      const r  = container.getBoundingClientRect()
+      const nw = Math.floor(r.width)  || 800
+      const nh = Math.floor(r.height) || 600
+      const { W, H } = dimRef.current
+      if (nw === W && nh === H) return
+      dimRef.current = { W: nw, H: nh }
+      canvas.width  = nw
+      canvas.height = nh
+      xfRef.current = clampXf(xfRef.current, nw, nh)
     }
-    setTimeout(setSize,0)
-    const ro=new ResizeObserver(setSize);ro.observe(container)
+    setTimeout(setSize, 0)
+    const ro = new ResizeObserver(setSize); ro.observe(container)
 
-    const getXY=e=>e.touches?{x:e.touches[0].clientX,y:e.touches[0].clientY}:{x:e.clientX,y:e.clientY}
-    const getRect=()=>canvas.getBoundingClientRect()
+    const getXY  = e => e.touches ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : { x: e.clientX, y: e.clientY }
+    const getRect = () => canvas.getBoundingClientRect()
 
-    const onDown=e=>{
-      if(e.touches?.length===2){
-        const dx=e.touches[0].clientX-e.touches[1].clientX
-        const dy=e.touches[0].clientY-e.touches[1].clientY
-        const r=getRect()
-        pinchRef.current={dist0:Math.hypot(dx,dy),scale0:xfRef.current.scale,
-          cx:(e.touches[0].clientX+e.touches[1].clientX)/2-r.left,
-          cy:(e.touches[0].clientY+e.touches[1].clientY)/2-r.top}
+    const onDown = e => {
+      if (e.touches?.length === 2) {
+        const dx = e.touches[0].clientX - e.touches[1].clientX
+        const dy = e.touches[0].clientY - e.touches[1].clientY
+        const r  = getRect()
+        pinchRef.current = { dist0: Math.hypot(dx, dy), scale0: xfRef.current.scale,
+          cx: (e.touches[0].clientX + e.touches[1].clientX) / 2 - r.left,
+          cy: (e.touches[0].clientY + e.touches[1].clientY) / 2 - r.top }
         return
       }
-      const{x,y}=getXY(e)
-      dragRef.current={sx:x,sy:y,tx0:xfRef.current.tx,ty0:xfRef.current.ty}
+      const { x, y } = getXY(e)
+      dragRef.current = { sx: x, sy: y, tx0: xfRef.current.tx, ty0: xfRef.current.ty }
     }
-    const onMove=e=>{
+    const onMove = e => {
       e.preventDefault()
-      if(e.touches?.length===2&&pinchRef.current){
-        const dx=e.touches[0].clientX-e.touches[1].clientX
-        const dy=e.touches[0].clientY-e.touches[1].clientY
-        const dist=Math.hypot(dx,dy)
-        const{W,H}=dimRef.current
-        const f=dist/pinchRef.current.dist0
-        const ns=Math.max(1,Math.min(14,pinchRef.current.scale0*f))
-        const rv=ns/pinchRef.current.scale0
-        xfRef.current=clampXf({scale:ns,
-          tx:pinchRef.current.cx-rv*(pinchRef.current.cx-xfRef.current.tx),
-          ty:pinchRef.current.cy-rv*(pinchRef.current.cy-xfRef.current.ty)},W,H)
+      if (e.touches?.length === 2 && pinchRef.current) {
+        const dx   = e.touches[0].clientX - e.touches[1].clientX
+        const dy   = e.touches[0].clientY - e.touches[1].clientY
+        const dist = Math.hypot(dx, dy)
+        const { W, H } = dimRef.current
+        const f  = dist / pinchRef.current.dist0
+        const ns = Math.max(1, Math.min(14, pinchRef.current.scale0 * f))
+        const rv = ns / pinchRef.current.scale0
+        xfRef.current = clampXf({ scale: ns,
+          tx: pinchRef.current.cx - rv * (pinchRef.current.cx - xfRef.current.tx),
+          ty: pinchRef.current.cy - rv * (pinchRef.current.cy - xfRef.current.ty) }, W, H)
         return
       }
-      if(!dragRef.current)return
-      const{x,y}=getXY(e)
-      const{W,H}=dimRef.current
-      xfRef.current=clampXf({...xfRef.current,
-        tx:dragRef.current.tx0+(x-dragRef.current.sx),
-        ty:dragRef.current.ty0+(y-dragRef.current.sy)},W,H)
+      if (!dragRef.current) return
+      const { x, y } = getXY(e)
+      const { W, H } = dimRef.current
+      xfRef.current = clampXf({ ...xfRef.current,
+        tx: dragRef.current.tx0 + (x - dragRef.current.sx),
+        ty: dragRef.current.ty0 + (y - dragRef.current.sy) }, W, H)
     }
-    const onUp=()=>{dragRef.current=null;pinchRef.current=null}
-    const onWheel=e=>{
+    const onUp    = () => { dragRef.current = null; pinchRef.current = null }
+    const onWheel = e => {
       e.preventDefault()
-      const r=getRect()
-      zoomAt(e.clientX-r.left,e.clientY-r.top,e.deltaY<0?1.18:1/1.18)
+      const r = getRect()
+      zoomAt(e.clientX - r.left, e.clientY - r.top, e.deltaY < 0 ? 1.18 : 1 / 1.18)
     }
-    canvas.addEventListener('mousedown',onDown)
-    canvas.addEventListener('mousemove',onMove)
-    canvas.addEventListener('mouseup',onUp)
-    canvas.addEventListener('mouseleave',onUp)
-    canvas.addEventListener('wheel',onWheel,{passive:false})
-    canvas.addEventListener('touchstart',onDown,{passive:true})
-    canvas.addEventListener('touchmove',onMove,{passive:false})
-    canvas.addEventListener('touchend',onUp)
+    canvas.addEventListener('mousedown',  onDown)
+    canvas.addEventListener('mousemove',  onMove)
+    canvas.addEventListener('mouseup',    onUp)
+    canvas.addEventListener('mouseleave', onUp)
+    canvas.addEventListener('wheel',      onWheel, { passive: false })
+    canvas.addEventListener('touchstart', onDown,  { passive: true })
+    canvas.addEventListener('touchmove',  onMove,  { passive: false })
+    canvas.addEventListener('touchend',   onUp)
 
-    const ringPath=(ring,wx,wy)=>{
-      let first=true
-      ring.forEach(([lng,lat])=>{
-        const px=wx(lng),py=wy(lat)
-        if(first){ctx.moveTo(px,py);first=false}else ctx.lineTo(px,py)
+    const ringPath = (ring, wx, wy) => {
+      let first = true
+      ring.forEach(([lng, lat]) => {
+        const px = wx(lng), py = wy(lat)
+        if (first) { ctx.moveTo(px, py); first = false } else ctx.lineTo(px, py)
       })
       ctx.closePath()
     }
 
-    const overlaps=(boxes,x,y,w,h)=>{
-      const pad=3
-      for(const b of boxes){
-        if(x-w/2-pad<b.x+b.w/2&&x+w/2+pad>b.x-b.w/2&&
-           y-h/2-pad<b.y+b.h/2&&y+h/2+pad>b.y-b.h/2)return true
+    const overlaps = (boxes, x, y, w, h) => {
+      const pad = 3
+      for (const b of boxes) {
+        if (x-w/2-pad < b.x+b.w/2 && x+w/2+pad > b.x-b.w/2 &&
+            y-h/2-pad < b.y+b.h/2 && y+h/2+pad > b.y-b.h/2) return true
       }
       return false
     }
 
-    const draw=()=>{
-      const{W,H}=dimRef.current
-      if(!W||!H){rafRef.current=requestAnimationFrame(draw);return}
-      const spd=SPD2D[speedRef.current]??SPD2D[1]
-      const arcs=filteredArcsRef.current
-      const{scale:s,tx,ty}=xfRef.current
-      const wx=lng=>((lng+180)/360)*W*s+tx
-      const wy=lat=>((90-lat)/180)*H*s+ty
-      const ids=new Set(arcs.map(a=>a.id))
-      Object.keys(arcStates.current).forEach(id=>{if(!ids.has(id))delete arcStates.current[id]})
-      arcs.forEach(arc=>{if(!arcStates.current[arc.id])arcStates.current[arc.id]={t:0,impacted:false,alpha:1,ringR:0}})
+    const draw = () => {
+      const { W, H } = dimRef.current
+      if (!W || !H) { rafRef.current = requestAnimationFrame(draw); return }
 
-      ctx.fillStyle='#030d07';ctx.fillRect(0,0,W,H)
+      const spd  = SPD2D[speedRef.current] ?? SPD2D[1]
+      const arcs = filteredArcsRef.current
+      const { scale: s, tx, ty } = xfRef.current
 
-      if(countriesRef.current){
+      const wx = lng => ((lng + 180) / 360) * W * s + tx
+      const wy = lat => ((90  - lat) / 180) * H * s + ty
+
+      const ids = new Set(arcs.map(a => a.id))
+      Object.keys(arcStates.current).forEach(id => { if (!ids.has(id)) delete arcStates.current[id] })
+      arcs.forEach(arc => { if (!arcStates.current[arc.id]) arcStates.current[arc.id] = { t: 0, impacted: false, alpha: 1, ringR: 0 } })
+
+      ctx.fillStyle = '#030d07'
+      ctx.fillRect(0, 0, W, H)
+
+      if (countriesRef.current) {
         ctx.beginPath()
-        countriesRef.current.forEach(f=>{
-          if(!f.geometry)return
-          if(f.geometry.type==='Polygon')f.geometry.coordinates.forEach(r=>ringPath(r,wx,wy))
-          else if(f.geometry.type==='MultiPolygon')f.geometry.coordinates.forEach(poly=>poly.forEach(r=>ringPath(r,wx,wy)))
+        countriesRef.current.forEach(f => {
+          if (!f.geometry) return
+          if (f.geometry.type === 'Polygon')      f.geometry.coordinates.forEach(r => ringPath(r, wx, wy))
+          else if (f.geometry.type === 'MultiPolygon') f.geometry.coordinates.forEach(poly => poly.forEach(r => ringPath(r, wx, wy)))
         })
-        ctx.fillStyle='#0d2016';ctx.fill('evenodd')
-        ctx.strokeStyle='rgba(50,130,70,0.75)'
-        ctx.lineWidth=Math.max(0.25,0.6/s)
-        countriesRef.current.forEach(f=>{
-          if(!f.geometry)return
+        ctx.fillStyle = '#0d2016'
+        ctx.fill('evenodd')
+
+        ctx.strokeStyle = 'rgba(50,130,70,0.75)'
+        ctx.lineWidth   = Math.max(0.25, 0.6 / s)
+        countriesRef.current.forEach(f => {
+          if (!f.geometry) return
           ctx.beginPath()
-          if(f.geometry.type==='Polygon')f.geometry.coordinates.forEach(r=>ringPath(r,wx,wy))
-          else if(f.geometry.type==='MultiPolygon')f.geometry.coordinates.forEach(poly=>poly.forEach(r=>ringPath(r,wx,wy)))
+          if (f.geometry.type === 'Polygon')      f.geometry.coordinates.forEach(r => ringPath(r, wx, wy))
+          else if (f.geometry.type === 'MultiPolygon') f.geometry.coordinates.forEach(poly => poly.forEach(r => ringPath(r, wx, wy)))
           ctx.stroke()
         })
       }
 
-      const entries=Object.entries(COUNTRIES)
-      const sorted=entries.slice().sort((a,b)=>(MIN_ZOOM[a[0]]??3.5)-(MIN_ZOOM[b[0]]??3.5))
-      ctx.textAlign='center';ctx.textBaseline='middle'
-      const boxes=[]
-      sorted.forEach(([code,{name,lat,lng}])=>{
-        const mz=MIN_ZOOM[code]??3.5
-        if(s<mz)return
-        const px=wx(lng),py=wy(lat)
-        if(px<-100||px>W+100||py<-30||py>H+30)return
-        const base=CITY_KEYS.has(code)?7:8
-        const fs=Math.min(11,base+(s-mz)*0.9)
-        if(fs<6.5)return
-        ctx.font=`500 ${fs.toFixed(1)}px monospace`
-        const metrics=ctx.measureText(name)
-        const lw=metrics.width+4,lh=fs+3
-        if(overlaps(boxes,px,py,lw,lh))return
-        boxes.push({x:px,y:py,w:lw,h:lh})
-        ctx.shadowColor='rgba(0,0,0,0.9)';ctx.shadowBlur=4
-        ctx.fillStyle=CITY_KEYS.has(code)?'rgba(70,185,210,.75)':'rgba(80,210,130,.82)'
-        ctx.fillText(name,px,py);ctx.shadowBlur=0
+      // ── Country labels (2D) ───────────────────────────────────────
+      const entries = Object.entries(COUNTRIES)
+      const sorted  = entries.slice().sort((a, b) => (MIN_ZOOM[a[0]] ?? 3.5) - (MIN_ZOOM[b[0]] ?? 3.5))
+      ctx.textAlign    = 'center'
+      ctx.textBaseline = 'middle'
+      const boxes = []
+
+      sorted.forEach(([code, { name, lat, lng }]) => {
+        const mz = MIN_ZOOM[code] ?? 3.5
+        if (s < mz) return
+        const px = wx(lng), py = wy(lat)
+        if (px < -100 || px > W + 100 || py < -30 || py > H + 30) return
+        const base = CITY_KEYS.has(code) ? 7 : 8
+        const fs   = Math.min(11, base + (s - mz) * 0.9)
+        if (fs < 6.5) return
+        ctx.font = `500 ${fs.toFixed(1)}px monospace`
+        const metrics = ctx.measureText(name)
+        const lw = metrics.width + 4, lh = fs + 3
+        if (overlaps(boxes, px, py, lw, lh)) return
+        boxes.push({ x: px, y: py, w: lw, h: lh })
+        ctx.shadowColor = 'rgba(0,0,0,0.9)'; ctx.shadowBlur = 4
+        ctx.fillStyle   = CITY_KEYS.has(code) ? 'rgba(70,185,210,.75)' : 'rgba(80,210,130,.82)'
+        ctx.fillText(name, px, py); ctx.shadowBlur = 0
       })
 
-      const dotR=Math.max(0.6,1.2/Math.sqrt(s))
-      entries.forEach(([code,{lat,lng}])=>{
-        if(CITY_KEYS.has(code)&&s<6)return
-        const px=wx(lng),py=wy(lat)
-        if(px<0||px>W||py<0||py>H)return
-        ctx.beginPath();ctx.arc(px,py,dotR,0,Math.PI*2)
-        ctx.fillStyle='rgba(0,210,100,0.40)';ctx.fill()
+      // ── Dots ──────────────────────────────────────────────────────
+      const dotR = Math.max(0.6, 1.2 / Math.sqrt(s))
+      entries.forEach(([code, { lat, lng }]) => {
+        if (CITY_KEYS.has(code) && s < 6) return
+        const px = wx(lng), py = wy(lat)
+        if (px < 0 || px > W || py < 0 || py > H) return
+        ctx.beginPath(); ctx.arc(px, py, dotR, 0, Math.PI * 2)
+        ctx.fillStyle = 'rgba(0,210,100,0.40)'; ctx.fill()
       })
 
-      arcs.slice(0,50).forEach(arc=>{
-        const st=arcStates.current[arc.id];if(!st||st.alpha<=0)return
-        const col=arc.typeColor||'#00ff88'
-        const sx=wx(arc.sourceLng),sy=wy(arc.sourceLat)
-        const tx2=wx(arc.targetLng),ty2=wy(arc.targetLat)
-        const mx=(sx+tx2)/2,my=(sy+ty2)/2-Math.min(H*.12,55)
-        const bez=t=>({x:(1-t)**2*sx+2*(1-t)*t*mx+t**2*tx2,y:(1-t)**2*sy+2*(1-t)*t*my+t**2*ty2})
-        if(!st.impacted){st.t=Math.min(st.t+spd,1);if(st.t>=1)st.impacted=true}
-        else{st.ringR+=1.8;st.alpha=Math.max(0,st.alpha-.025)}
-        ctx.beginPath();ctx.moveTo(sx,sy);ctx.quadraticCurveTo(mx,my,tx2,ty2)
-        ctx.strokeStyle=col+'12';ctx.lineWidth=1;ctx.stroke()
-        if(!st.impacted||st.alpha>.5){
-          const COMET=.13,tailT=Math.max(0,st.t-COMET)
-          ctx.beginPath();let mv=false
-          for(let k=0;k<=20;k++){
-            const t_=tailT+(k/20)*(st.t-tailT);const p=bez(t_)
-            if(!mv){ctx.moveTo(p.x,p.y);mv=true}else ctx.lineTo(p.x,p.y)
+      // ── Missiles ──────────────────────────────────────────────────
+      arcs.slice(0, 50).forEach(arc => {
+        const st = arcStates.current[arc.id]; if (!st || st.alpha <= 0) return
+        const col = arc.typeColor || '#00ff88'
+        const sx  = wx(arc.sourceLng), sy = wy(arc.sourceLat)
+        const tx2 = wx(arc.targetLng), ty2 = wy(arc.targetLat)
+        const mx  = (sx + tx2) / 2, my = (sy + ty2) / 2 - Math.min(H * .12, 55)
+        const bez = t => ({ x: (1-t)**2*sx + 2*(1-t)*t*mx + t**2*tx2, y: (1-t)**2*sy + 2*(1-t)*t*my + t**2*ty2 })
+
+        if (!st.impacted) { st.t = Math.min(st.t + spd, 1); if (st.t >= 1) st.impacted = true }
+        else { st.ringR += 1.8; st.alpha = Math.max(0, st.alpha - .025) }
+
+        ctx.beginPath(); ctx.moveTo(sx, sy); ctx.quadraticCurveTo(mx, my, tx2, ty2)
+        ctx.strokeStyle = col + '12'; ctx.lineWidth = 1; ctx.stroke()
+
+        if (!st.impacted || st.alpha > .5) {
+          const COMET = .13, tailT = Math.max(0, st.t - COMET)
+          ctx.beginPath(); let mv = false
+          for (let k = 0; k <= 20; k++) {
+            const t_ = tailT + (k/20) * (st.t - tailT); const p = bez(t_)
+            if (!mv) { ctx.moveTo(p.x, p.y); mv = true } else ctx.lineTo(p.x, p.y)
           }
-          if(mv){ctx.strokeStyle=col+'cc';ctx.lineWidth=arc.severity==='critical'?2.5:1.5;ctx.stroke()}
-          const hp=bez(st.t)
-          ctx.beginPath();ctx.arc(hp.x,hp.y,arc.severity==='critical'?3.5:2.5,0,Math.PI*2)
-          ctx.fillStyle=col;ctx.shadowBlur=10;ctx.shadowColor=col;ctx.fill();ctx.shadowBlur=0
+          if (mv) { ctx.strokeStyle = col + 'cc'; ctx.lineWidth = arc.severity === 'critical' ? 2.5 : 1.5; ctx.stroke() }
+          const hp = bez(st.t)
+          ctx.beginPath(); ctx.arc(hp.x, hp.y, arc.severity === 'critical' ? 3.5 : 2.5, 0, Math.PI * 2)
+          ctx.fillStyle = col; ctx.shadowBlur = 10; ctx.shadowColor = col; ctx.fill(); ctx.shadowBlur = 0
         }
-        if(st.impacted&&st.ringR>0){
-          const tp2=bez(1)
-          ctx.beginPath();ctx.arc(tp2.x,tp2.y,st.ringR,0,Math.PI*2)
-          ctx.strokeStyle=col+Math.round(st.alpha*160).toString(16).padStart(2,'0')
-          ctx.lineWidth=1.5;ctx.stroke()
+        if (st.impacted && st.ringR > 0) {
+          const tp2 = bez(1)
+          ctx.beginPath(); ctx.arc(tp2.x, tp2.y, st.ringR, 0, Math.PI * 2)
+          ctx.strokeStyle = col + Math.round(st.alpha * 160).toString(16).padStart(2, '0')
+          ctx.lineWidth = 1.5; ctx.stroke()
         }
       })
-      rafRef.current=requestAnimationFrame(draw)
+
+      rafRef.current = requestAnimationFrame(draw)
     }
     draw()
-    return()=>{
-      cancelAnimationFrame(rafRef.current);ro.disconnect()
-      canvas.removeEventListener('mousedown',onDown)
-      canvas.removeEventListener('mousemove',onMove)
-      canvas.removeEventListener('mouseup',onUp)
-      canvas.removeEventListener('mouseleave',onUp)
-      canvas.removeEventListener('wheel',onWheel)
-      canvas.removeEventListener('touchstart',onDown)
-      canvas.removeEventListener('touchmove',onMove)
-      canvas.removeEventListener('touchend',onUp)
+    return () => {
+      cancelAnimationFrame(rafRef.current); ro.disconnect()
+      canvas.removeEventListener('mousedown',  onDown)
+      canvas.removeEventListener('mousemove',  onMove)
+      canvas.removeEventListener('mouseup',    onUp)
+      canvas.removeEventListener('mouseleave', onUp)
+      canvas.removeEventListener('wheel',      onWheel)
+      canvas.removeEventListener('touchstart', onDown)
+      canvas.removeEventListener('touchmove',  onMove)
+      canvas.removeEventListener('touchend',   onUp)
     }
-  },[])
+  }, [])
 
-  const doZoom=f=>zoomAt(dimRef.current.W/2,dimRef.current.H/2,f)
-  const resetZoom=()=>{xfRef.current={scale:1,tx:0,ty:0}}
+  const doZoom    = f => zoomAt(dimRef.current.W / 2, dimRef.current.H / 2, f)
+  const resetZoom = ()  => { xfRef.current = { scale: 1, tx: 0, ty: 0 } }
 
-  return(
-    <div ref={containerRef} style={{position:'absolute',inset:0,background:'#030d07',overflow:'hidden'}}>
-      <canvas ref={canvasRef} style={{display:'block',width:'100%',height:'100%',cursor:'grab'}}/>
-      <div style={{position:'absolute',bottom:58,right:12,display:'flex',flexDirection:'column',gap:4,zIndex:20}}>
-        {[{l:'+',f:1.5},{l:'\u2212',f:1/1.5},{l:'\u2302',f:null}].map(({l,f})=>(
-          <button key={l} onClick={()=>f?doZoom(f):resetZoom()}
-            style={{width:28,height:28,background:'rgba(0,20,10,.9)',border:'1px solid rgba(0,200,80,.4)',
-              color:'#00cc66',borderRadius:4,fontFamily:'monospace',fontSize:16,cursor:'pointer',
-              textAlign:'center',lineHeight:'26px',padding:0,userSelect:'none'}}>
+  return (
+    <div ref={containerRef} style={{ position: 'absolute', inset: 0, background: '#030d07', overflow: 'hidden' }}>
+      <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%', cursor: 'grab' }} />
+      <div style={{ position: 'absolute', bottom: 58, right: 12, display: 'flex', flexDirection: 'column', gap: 4, zIndex: 20 }}>
+        {[{ l: '+', f: 1.5 }, { l: '\u2212', f: 1/1.5 }, { l: '\u2302', f: null }].map(({ l, f }) => (
+          <button key={l} onClick={() => f ? doZoom(f) : resetZoom()}
+            style={{ width: 28, height: 28, background: 'rgba(0,20,10,.9)', border: '1px solid rgba(0,200,80,.4)',
+              color: '#00cc66', borderRadius: 4, fontFamily: 'monospace', fontSize: 16, cursor: 'pointer',
+              textAlign: 'center', lineHeight: '26px', padding: 0, userSelect: 'none' }}>
             {l}
           </button>
         ))}
       </div>
-      <div style={{position:'absolute',bottom:58,left:12,zIndex:20,fontFamily:'monospace',
-        fontSize:10,color:'rgba(0,200,80,.4)',pointerEvents:'none'}}>
-        scroll/drag \u00b7 pan+zoom
+      <div style={{ position: 'absolute', bottom: 58, left: 12, zIndex: 20, fontFamily: 'monospace',
+        fontSize: 10, color: 'rgba(0,200,80,.4)', pointerEvents: 'none' }}>
+        scroll/drag · pan+zoom
       </div>
     </div>
   )
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 // 3-D GLOBE
-// ═══════════════════════════════════════════════════════════════════
-function ThreeGlobe({filteredArcs,isRotating,speedLevel}){
-  const mountRef=useRef(null)
-  const refs=useRef({})
-  const speedRef=useRef(speedLevel)
-  const renderedRef=useRef(new Set())
+// ═══════════════════════════════════════════════════════════════════════
+function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
+  const mountRef    = useRef(null)
+  const refs        = useRef({})
+  const speedRef    = useRef(speedLevel)
+  const renderedRef = useRef(new Set())
 
-  useEffect(()=>{speedRef.current=speedLevel},[speedLevel])
+  useEffect(() => { speedRef.current = speedLevel }, [speedLevel])
 
-  useEffect(()=>{
-    const el=mountRef.current;if(!el)return
-    const W=el.clientWidth||800,H=el.clientHeight||600
-    const scene=new THREE.Scene()
-    const camera=new THREE.PerspectiveCamera(45,W/H,.1,100)
-    camera.position.z=2.5
-    const renderer=new THREE.WebGLRenderer({antialias:true,alpha:true})
-    renderer.setSize(W,H);renderer.setPixelRatio(Math.min(window.devicePixelRatio,2))
+  useEffect(() => {
+    const el = mountRef.current; if (!el) return
+    const W = el.clientWidth || 800, H = el.clientHeight || 600
+    const scene    = new THREE.Scene()
+    const camera   = new THREE.PerspectiveCamera(45, W/H, .1, 100)
+    camera.position.z = 2.5
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
+    renderer.setSize(W, H)
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     el.appendChild(renderer.domElement)
-    const controls=new OrbitControls(camera,renderer.domElement)
-    controls.enableDamping=true;controls.dampingFactor=.05
-    controls.autoRotate=true;controls.autoRotateSpeed=.25
-    controls.enableZoom=true;controls.minDistance=1.25;controls.maxDistance=5
-    controls.touches={ONE:THREE.TOUCH.ROTATE,TWO:THREE.TOUCH.DOLLY_ROTATE}
 
-    scene.add(new THREE.AmbientLight(0x445566,2.5))
-    const sun=new THREE.DirectionalLight(0x88aacc,.45);sun.position.set(4,2,4);scene.add(sun)
+    const controls = new OrbitControls(camera, renderer.domElement)
+    controls.enableDamping   = true
+    controls.dampingFactor   = .05
+    controls.autoRotate      = true
+    controls.autoRotateSpeed = .25
+    controls.enableZoom      = true
+    controls.minDistance     = 1.25
+    controls.maxDistance     = 5
+    controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_ROTATE }
+
+    scene.add(new THREE.AmbientLight(0x445566, 2.5))
+    const sun = new THREE.DirectionalLight(0x88aacc, .45); sun.position.set(4, 2, 4); scene.add(sun)
 
     buildStars(scene)
     buildGlobe(scene)
     buildAtmosphere(scene)
-    const labels=buildLabels3D(scene)   // sorted big-first
+    const labelSprites = buildLabels3D(scene)   // sorted big-first
     buildCountryBorders(scene)
 
-    const missilesGrp=new THREE.Group(),trailsGrp=new THREE.Group(),spikesGrp=new THREE.Group()
-    scene.add(missilesGrp,trailsGrp,spikesGrp)
+    const missilesGrp = new THREE.Group(), trailsGrp = new THREE.Group(), spikesGrp = new THREE.Group()
+    scene.add(missilesGrp, trailsGrp, spikesGrp)
 
-    const onResize=()=>{
-      camera.aspect=el.clientWidth/el.clientHeight;camera.updateProjectionMatrix()
-      renderer.setSize(el.clientWidth,el.clientHeight)
+    const onResize = () => {
+      camera.aspect = el.clientWidth / el.clientHeight; camera.updateProjectionMatrix()
+      renderer.setSize(el.clientWidth, el.clientHeight)
     }
-    window.addEventListener('resize',onResize)
+    window.addEventListener('resize', onResize)
 
-    // Reusable objects for projection
-    const _ndc    = new THREE.Vector3()
-    const _camDir = new THREE.Vector3()
+    const _ndc = new THREE.Vector3()
 
     let rafId
-    const animate=()=>{
-      rafId=requestAnimationFrame(animate)
+    const animate = () => {
+      rafId = requestAnimationFrame(animate)
       controls.update()
 
-      const camDist=camera.position.length()
-      camera.position.clone().normalize(_camDir)
-      const rW=renderer.domElement.clientWidth  ||W
-      const rH=renderer.domElement.clientHeight ||H
+      const camDist = camera.position.length()
+      const camNorm = camera.position.clone().normalize()
 
-      // ── Per-frame screen-space collision cull ────────────────────
-      // Accepted boxes in NDC (x: -1..1, y: -1..1)
-      const screenBoxes=[]
+      // ── Per-frame screen-space collision cull ─────────────────────
+      const screenBoxes = []
 
-      labels.forEach(spr=>{
-        const ud=spr.userData
+      labelSprites.forEach(spr => {
+        const ud = spr.userData
 
         // 1. Distance gate
-        if(camDist>ud.maxDist){spr.visible=false;return}
+        if (camDist > ud.maxDist) { spr.visible = false; return }
 
-        // 2. Back-face cull ( on far side of globe)
-        const sprDir=spr.position.clone().normalize()
-        if(sprDir.dot(camera.position.clone().normalize())<0.12){spr.visible=false;return}
+        // 2. Back-face cull
+        const sprDir = spr.position.clone().normalize()
+        if (sprDir.dot(camNorm) < 0.12) { spr.visible = false; return }
 
         // 3. Project to NDC
         _ndc.copy(spr.position)
         _ndc.project(camera)
-        const nx=_ndc.x, ny=_ndc.y
+        const nx = _ndc.x, ny = _ndc.y
+        if (nx < -1.1 || nx > 1.1 || ny < -1.1 || ny > 1.1) { spr.visible = false; return }
 
-        // off-screen entirely
-        if(nx<-1.1||nx>1.1||ny<-1.1||ny>1.1){spr.visible=false;return}
+        // 4. Estimated screen half-extents
+        const halfW = (spr.scale.x / camDist) * (1.8 / camera.aspect)
+        const halfH = (spr.scale.y / camDist) * 1.8
 
-        // Half-extents of the  in NDC space
-        // spr.scale is world-units; approximate NDC size:
-        // ndcW = scale.x / camDist * (1/tan(fov/2)) * aspect^-1 ... simplified:
-        const halfW=(spr.scale.x/camDist)*(1.8/camera.aspect)
-        const halfH=(spr.scale.y/camDist)*1.8
-
-        // 4. Screen-space collision check (big countries already accepted first)
-        let blocked=false
-        for(const b of screenBoxes){
-          const pad=0.04  // NDC padding between labels
-          if(nx-halfW-pad < b.x+b.hw &&
-             nx+halfW+pad > b.x-b.hw &&
-             ny-halfH-pad < b.y+b.hh &&
-             ny+halfH+pad > b.y-b.hh){
-            blocked=true;break
-          }
+        // 5. Collision check
+        let blocked = false
+        for (const b of screenBoxes) {
+          const pad = 0.035
+          if (nx - halfW - pad < b.x + b.hw &&
+              nx + halfW + pad > b.x - b.hw &&
+              ny - halfH - pad < b.y + b.hh &&
+              ny + halfH + pad > b.y - b.hh) { blocked = true; break }
         }
-        if(blocked){spr.visible=false;return}
+        if (blocked) { spr.visible = false; return }
 
-        screenBoxes.push({x:nx,y:ny,hw:halfW,hh:halfH})
-        spr.visible=true
+        screenBoxes.push({ x: nx, y: ny, hw: halfW, hh: halfH })
+        spr.visible = true
       })
 
-      // ── Missiles ────────────────────────────────────────────────
-      const spd=SPD3D[speedRef.current]??SPD3D[1]
-      missilesGrp.children.forEach(m=>{
-        const ud=m.userData
-        if(ud.state==='flying'){
-          ud.t=Math.min(ud.t+spd,1)
-          const idx=Math.min(Math.floor(ud.t*ud.points.length),ud.points.length-1)
+      // ── Missiles ──────────────────────────────────────────────────
+      const spd = SPD3D[speedRef.current] ?? SPD3D[1]
+      missilesGrp.children.forEach(m => {
+        const ud = m.userData
+        if (ud.state === 'flying') {
+          ud.t = Math.min(ud.t + spd, 1)
+          const idx = Math.min(Math.floor(ud.t * ud.points.length), ud.points.length - 1)
           m.position.copy(ud.points[idx])
-          if(ud.trail){
-            const tIdx=Math.max(0,idx-Math.floor(ud.points.length*.12))
-            const vis=ud.points.slice(tIdx,idx+1)
-            if(vis.length>=2)ud.trail.geometry.setFromPoints(vis)
+          if (ud.trail) {
+            const tIdx = Math.max(0, idx - Math.floor(ud.points.length * .12))
+            const vis  = ud.points.slice(tIdx, idx + 1)
+            if (vis.length >= 2) ud.trail.geometry.setFromPoints(vis)
           }
-          if(ud.t>=1){
-            ud.state='impact'
-            for(let i=0;i<(ud.isCrit?5:3);i++){
-              const bPos=ll2v(ud.targetLat+(Math.random()-.5)*.8,ud.targetLng+(Math.random()-.5)*.8,R)
-              const spk=new THREE.Line(
-                new THREE.BufferGeometry().setFromPoints([bPos.clone(),bPos.clone()]),
-                new THREE.LineBasicMaterial({color:ud.color,transparent:true,opacity:0})
+          if (ud.t >= 1) {
+            ud.state = 'impact'
+            for (let i = 0; i < (ud.isCrit ? 5 : 3); i++) {
+              const bPos = ll2v(ud.targetLat + (Math.random()-.5)*.8, ud.targetLng + (Math.random()-.5)*.8, R)
+              const spk  = new THREE.Line(
+                new THREE.BufferGeometry().setFromPoints([bPos.clone(), bPos.clone()]),
+                new THREE.LineBasicMaterial({ color: ud.color, transparent: true, opacity: 0 })
               )
-              spk.userData={base:bPos.clone(),norm:bPos.clone().normalize(),
-                maxH:.04+Math.random()*.055,age:0,delay:i*6,maxAge:150+i*20,done:false}
+              spk.userData = { base: bPos.clone(), norm: bPos.clone().normalize(),
+                maxH: .04 + Math.random() * .055, age: 0, delay: i*6, maxAge: 150 + i*20, done: false }
               spikesGrp.add(spk)
             }
           }
-        }else if(ud.state==='impact'){
-          m.material.opacity=Math.max(0,m.material.opacity-.08)
-          if(ud.trail)ud.trail.material.opacity=Math.max(0,ud.trail.material.opacity-.05)
-          if(ud.ghost)ud.ghost.material.opacity=Math.max(0,ud.ghost.material.opacity-.02)
-          if(m.material.opacity<=0)ud.state='done'
+        } else if (ud.state === 'impact') {
+          m.material.opacity = Math.max(0, m.material.opacity - .08)
+          if (ud.trail) ud.trail.material.opacity = Math.max(0, ud.trail.material.opacity - .05)
+          if (ud.ghost) ud.ghost.material.opacity = Math.max(0, ud.ghost.material.opacity - .02)
+          if (m.material.opacity <= 0) ud.state = 'done'
         }
       })
 
-      spikesGrp.children.forEach(spk=>{
-        const ud=spk.userData
-        if(ud.delay>0){ud.delay-=1;return}
-        ud.age+=1;const t=ud.age/ud.maxAge
-        let h,op
-        if(t<.15){h=(t/.15)*ud.maxH;op=t/.15}
-        else if(t<.72){h=ud.maxH*(1+.09*Math.sin(ud.age*.35));op=1}
-        else{const f=(t-.72)/.28;h=ud.maxH*(1-f*.4);op=1-f}
-        spk.geometry.setFromPoints([ud.base.clone(),ud.base.clone().add(ud.norm.clone().multiplyScalar(h))])
-        spk.material.opacity=Math.max(0,op)
-        if(ud.age>=ud.maxAge)ud.done=true
+      spikesGrp.children.forEach(spk => {
+        const ud = spk.userData
+        if (ud.delay > 0) { ud.delay -= 1; return }
+        ud.age += 1; const t = ud.age / ud.maxAge
+        let h, op
+        if (t < .15)      { h = (t/.15) * ud.maxH; op = t/.15 }
+        else if (t < .72) { h = ud.maxH * (1 + .09 * Math.sin(ud.age * .35)); op = 1 }
+        else              { const f = (t-.72)/.28; h = ud.maxH*(1-f*.4); op = 1-f }
+        spk.geometry.setFromPoints([ud.base.clone(), ud.base.clone().add(ud.norm.clone().multiplyScalar(h))])
+        spk.material.opacity = Math.max(0, op)
+        if (ud.age >= ud.maxAge) ud.done = true
       })
 
-      missilesGrp.children.filter(m=>m.userData.state==='done').forEach(m=>{
-        m.geometry.dispose();m.material.dispose()
-        if(m.userData.trail){m.userData.trail.geometry.dispose();m.userData.trail.material.dispose();trailsGrp.remove(m.userData.trail)}
-        if(m.userData.ghost){m.userData.ghost.geometry.dispose();m.userData.ghost.material.dispose();trailsGrp.remove(m.userData.ghost)}
+      missilesGrp.children.filter(m => m.userData.state === 'done').forEach(m => {
+        m.geometry.dispose(); m.material.dispose()
+        if (m.userData.trail) { m.userData.trail.geometry.dispose(); m.userData.trail.material.dispose(); trailsGrp.remove(m.userData.trail) }
+        if (m.userData.ghost) { m.userData.ghost.geometry.dispose(); m.userData.ghost.material.dispose(); trailsGrp.remove(m.userData.ghost) }
         missilesGrp.remove(m)
       })
-      spikesGrp.children.filter(s=>s.userData.done).forEach(s=>{s.geometry.dispose();s.material.dispose();spikesGrp.remove(s)})
-      if(renderedRef.current.size>600)renderedRef.current.clear()
-      renderer.render(scene,camera)
+      spikesGrp.children.filter(s => s.userData.done).forEach(s => { s.geometry.dispose(); s.material.dispose(); spikesGrp.remove(s) })
+      if (renderedRef.current.size > 600) renderedRef.current.clear()
+      renderer.render(scene, camera)
     }
     animate()
 
-    refs.current={scene,missilesGrp,trailsGrp,spikesGrp,controls,renderer,el}
-    return()=>{
-      cancelAnimationFrame(rafId);window.removeEventListener('resize',onResize)
-      controls.dispose();renderer.dispose()
-      if(el.contains(renderer.domElement))el.removeChild(renderer.domElement)
+    refs.current = { scene, missilesGrp, trailsGrp, spikesGrp, controls, renderer, el }
+    return () => {
+      cancelAnimationFrame(rafId); window.removeEventListener('resize', onResize)
+      controls.dispose(); renderer.dispose()
+      if (el.contains(renderer.domElement)) el.removeChild(renderer.domElement)
     }
-  },[])
+  }, [])
 
-  useEffect(()=>{const{controls}=refs.current;if(controls)controls.autoRotate=isRotating},[isRotating])
+  useEffect(() => { const { controls } = refs.current; if (controls) controls.autoRotate = isRotating }, [isRotating])
 
-  useEffect(()=>{
-    const{missilesGrp,trailsGrp}=refs.current;if(!missilesGrp)return
-    filteredArcs.slice(0,60).forEach(arc=>{
-      if(renderedRef.current.has(arc.id))return
+  useEffect(() => {
+    const { missilesGrp, trailsGrp } = refs.current; if (!missilesGrp) return
+    filteredArcs.slice(0, 60).forEach(arc => {
+      if (renderedRef.current.has(arc.id)) return
       renderedRef.current.add(arc.id)
-      const pts=arcPoints(arc),col=new THREE.Color(arc.typeColor||'#00ff88'),isCrit=arc.severity==='critical'
-      const ghost=new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),new THREE.LineBasicMaterial({color:col,transparent:true,opacity:.06}))
-      const trail=new THREE.Line(new THREE.BufferGeometry().setFromPoints([pts[0].clone(),pts[0].clone()]),new THREE.LineBasicMaterial({color:col,transparent:true,opacity:isCrit?.95:.72}))
-      const missile=new THREE.Mesh(new THREE.SphereGeometry(isCrit?.013:.009,6,6),new THREE.MeshBasicMaterial({color:col,transparent:true,opacity:1}))
+      const pts   = arcPoints(arc)
+      const col   = new THREE.Color(arc.typeColor || '#00ff88')
+      const isCrit = arc.severity === 'critical'
+      const ghost  = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: .06 }))
+      const trail  = new THREE.Line(new THREE.BufferGeometry().setFromPoints([pts[0].clone(), pts[0].clone()]), new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: isCrit ? .95 : .72 }))
+      const missile = new THREE.Mesh(new THREE.SphereGeometry(isCrit ? .013 : .009, 6, 6), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 1 }))
       missile.position.copy(pts[0])
-      missile.userData={points:pts,t:0,state:'flying',color:col,isCrit,
-        targetPos:pts[pts.length-1].clone(),targetLat:arc.targetLat,targetLng:arc.targetLng,trail,ghost}
-      trailsGrp.add(ghost);trailsGrp.add(trail);missilesGrp.add(missile)
+      missile.userData = { points: pts, t: 0, state: 'flying', color: col, isCrit,
+        targetPos: pts[pts.length-1].clone(), targetLat: arc.targetLat, targetLng: arc.targetLng, trail, ghost }
+      trailsGrp.add(ghost); trailsGrp.add(trail); missilesGrp.add(missile)
     })
-  },[filteredArcs])
+  }, [filteredArcs])
 
-  return <div ref={mountRef} style={{width:'100%',height:'100%'}}/>
+  return <div ref={mountRef} style={{ width: '100%', height: '100%' }} />
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 // EXPORT
-// ═══════════════════════════════════════════════════════════════════
-export default function GlobeView(){
-  const{globeView,heatmapActive,attacks,isRotating,speedLevel,selectedTypes,selectedSeverities}=useStore()
-  const[webglOk]=useState(()=>{
-    try{const c=document.createElement('canvas');return!!(window.WebGLRenderingContext&&(c.getContext('webgl')||c.getContext('experimental-webgl')))}catch{return false}
+// ═══════════════════════════════════════════════════════════════════════
+export default function GlobeView() {
+  const { globeView, heatmapActive, attacks, isRotating, speedLevel, selectedTypes, selectedSeverities } = useStore()
+  const [webglOk] = useState(() => {
+    try { const c = document.createElement('canvas'); return !!(window.WebGLRenderingContext && (c.getContext('webgl') || c.getContext('experimental-webgl'))) } catch { return false }
   })
-  const filteredArcs=attacks
-    .filter(a=>selectedTypes.includes(a.type)&&selectedSeverities.includes(a.severity))
-    .slice(0,60)
+  const filteredArcs = attacks
+    .filter(a => selectedTypes.includes(a.type) && selectedSeverities.includes(a.severity))
+    .slice(0, 60)
 
-  if(globeView==='flat'||!webglOk)return(
-    <div style={{position:'relative',width:'100%',height:'100%'}}>
-      <FlatMapView filteredArcs={filteredArcs} speedLevel={speedLevel}/>
-      {!webglOk&&<div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-yellow-500/20 border border-yellow-500/40 text-yellow-300 text-xs px-3 py-1.5 rounded-lg">WebGL unavailable</div>}
+  if (globeView === 'flat' || !webglOk) return (
+    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+      <FlatMapView filteredArcs={filteredArcs} speedLevel={speedLevel} />
+      {!webglOk && <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-yellow-500/20 border border-yellow-500/40 text-yellow-300 text-xs px-3 py-1.5 rounded-lg">WebGL unavailable</div>}
     </div>
   )
 
-  return(
-    <div style={{position:'relative',width:'100%',height:'100%',background:'#000'}}>
-      <ThreeGlobe filteredArcs={filteredArcs} isRotating={isRotating} speedLevel={speedLevel}/>
-      {heatmapActive&&<div className="absolute inset-0 pointer-events-none" style={{background:'radial-gradient(ellipse at 35% 45%,rgba(0,60,200,.05) 0%,transparent 55%),radial-gradient(ellipse at 65% 55%,rgba(100,0,200,.04) 0%,transparent 50%)'}}/>}
+  return (
+    <div style={{ position: 'relative', width: '100%', height: '100%', background: '#000' }}>
+      <ThreeGlobe filteredArcs={filteredArcs} isRotating={isRotating} speedLevel={speedLevel} />
+      {heatmapActive && <div className="absolute inset-0 pointer-events-none" style={{ background: 'radial-gradient(ellipse at 35% 45%,rgba(0,60,200,.05) 0%,transparent 55%),radial-gradient(ellipse at 65% 55%,rgba(100,0,200,.04) 0%,transparent 50%)' }} />}
     </div>
   )
 }
