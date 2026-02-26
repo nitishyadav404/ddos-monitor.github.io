@@ -1,11 +1,10 @@
 /**
  * GlobeView.jsx — 3D Globe + 2D Flat Map
  *
- * Atmosphere: ONE BackSide sphere at 1.5R.
- * Single shader blends:
- *   • A wide soft Fresnel halo (glow) that bleeds into space
- *   • Animated noise wisps confined to the outermost rim band
- * Result: Kaspersky-style single atmospheric haze — no double ring.
+ * Atmosphere: FrontSide shell at 1.5R.
+ * Glow is MAXIMUM at the globe circumference edge (rim=1),
+ * then linearly fades outward into space (rim->0 = fully transparent).
+ * 100Lu → 80 → 60 → 40 → 20 → 10 → 0Lu as described.
  */
 import React, { useRef, useEffect, useState } from 'react'
 import * as THREE from 'three'
@@ -146,12 +145,20 @@ async function buildCountryBorders(scene) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// UNIFIED ATMOSPHERE — single BackSide shell at 1.5R
-// One shader = one ring around the globe silhouette.
-// Combines:
-//   • Wide soft Fresnel halo (glow) decaying into space
-//   • Subtle animated noise wisps only in the outermost rim band
-// NO second sphere. No double bubble.
+// ATMOSPHERE — FrontSide shell at 1.5R
+//
+// KEY INSIGHT: FrontSide means fragments face the camera.
+// rim = 1 - |dot(normal, viewDir)|
+//   rim ≈ 1  → grazing angle = the silhouette EDGE (globe circumference)
+//   rim ≈ 0  → face-on = the middle of the disc (pointing away into space)
+//
+// So:  alpha = pow(rim, N)  gives MAX brightness at the edge (rim=1)
+//      and fades to 0 toward the centre of the shell face.
+// With FrontSide, the centre of the shell faces space → it's transparent.
+// The circumference ring (rim=1) is fully bright → 100 Lu.
+// Everything in between fades: 100→80→60→40→20→10→0.
+//
+// No BackSide needed. No double ring. One clean halo exactly at the edge.
 // ═══════════════════════════════════════════════════════════════════════
 const ATMO_VERT = /* glsl */`
   varying vec3 vWorldPos;
@@ -173,7 +180,7 @@ const ATMO_FRAG = /* glsl */`
   varying vec3  vNormal;
   varying vec3  vViewDir;
 
-  // ── compact hash noise ──────────────────────────────────────────
+  // ── noise helpers ──────────────────────────────────────────────
   float hash31(vec3 p) {
     p  = fract(p * vec3(127.1, 311.7, 74.7));
     p += dot(p, p.yzx + 19.19);
@@ -182,7 +189,7 @@ const ATMO_FRAG = /* glsl */`
   float vnoise(vec3 p) {
     vec3 i = floor(p); vec3 f = fract(p);
     vec3 u = f*f*(3.0-2.0*f);
-    float a=hash31(i),b=hash31(i+vec3(1,0,0)),
+    float a=hash31(i),           b=hash31(i+vec3(1,0,0)),
           c=hash31(i+vec3(0,1,0)),d=hash31(i+vec3(1,1,0)),
           e=hash31(i+vec3(0,0,1)),g=hash31(i+vec3(1,0,1)),
           h=hash31(i+vec3(0,1,1)),k=hash31(i+vec3(1,1,1));
@@ -196,53 +203,54 @@ const ATMO_FRAG = /* glsl */`
   }
 
   void main() {
-    // rim = 0 face-on, 1 at grazing edge
-    float rim = 1.0 - abs(dot(vNormal, vViewDir));
-    rim = clamp(rim, 0.0, 1.0);
+    // rim: 1.0 = silhouette edge (globe circumference), 0.0 = disc centre
+    float ndotv = abs(dot(vNormal, vViewDir));
+    float rim   = 1.0 - ndotv;          // 1 at edge, 0 at face-on
+    rim         = clamp(rim, 0.0, 1.0);
 
-    // ── BASE GLOW ─────────────────────────────────────────────────
-    // Soft wide Fresnel that fans into space (low power = wide band)
-    float glowBase  = pow(rim, 2.2);
-    // Exponential density: dense at limb, zero toward centre of disc
-    float density   = exp(-2.8 * (1.0 - rim));
-    float glowAlpha = glowBase * density * 0.68;
+    // ── GLOW: 100% at rim=1, decays to 0 outward ─────────────────
+    // pow(rim, 3.5): tight sharp band at circumference
+    // multiply by rim itself for extra falloff control
+    float glow  = pow(rim, 3.5);         // peak at edge, steep falloff
+    float alpha = glow * 0.90;           // max ~90% opacity at the exact edge
 
-    // ── WISPY MIST — only in outermost rim band ───────────────────
-    // rimGate kills anything below the horizon (rim < 0.60)
-    // so mist NEVER touches the globe face
-    float rimGate = smoothstep(0.60, 0.80, rim);
-    vec3  p1 = vWorldPos * 2.6 + vec3( uTime*0.055, uTime*0.040, -uTime*0.030);
-    vec3  p2 = vWorldPos * 5.0 + vec3(-uTime*0.095, uTime*0.075,  uTime*0.050);
-    float n  = fbm(p1) + fbm(p2) * 0.45;
-    float mist = smoothstep(0.52, 1.0, n) * rimGate * 0.30;
+    // ── WISPY MIST: only in tight edge band ──────────────────────
+    // rimGate: zero below rim 0.65, ramps to 1 at rim 0.85
+    float rimGate = smoothstep(0.65, 0.88, rim);
+    vec3  p1 = vWorldPos * 2.6 + vec3( uTime*0.055,  uTime*0.040, -uTime*0.030);
+    vec3  p2 = vWorldPos * 5.0 + vec3(-uTime*0.095,  uTime*0.075,  uTime*0.050);
+    float n   = fbm(p1) + fbm(p2) * 0.45;
+    float mist = smoothstep(0.50, 1.0, n) * rimGate * 0.25;
 
     // ── COMBINE ───────────────────────────────────────────────────
-    float alpha = glowAlpha + mist;
-    if (alpha < 0.005) discard;
-    alpha = min(alpha, 0.92); // never fully opaque
+    float finalAlpha = alpha + mist;
+    if (finalAlpha < 0.004) discard;
+    finalAlpha = min(finalAlpha, 0.95);
 
-    // Colour: deep green at base, bright cyber-green at edge wisps
-    vec3 baseCol = mix(vec3(0.0, 0.45, 0.18), vec3(0.0, 1.0, 0.4), glowBase);
-    vec3 mistCol = vec3(0.0, 1.0, 0.45);
-    vec3 col     = mix(baseCol, mistCol, mist / max(alpha, 0.001));
+    // Colour: bright cyber-green at edge, deeper green further out
+    vec3 edgeCol = vec3(0.10, 1.00, 0.45);   // bright at rim=1
+    vec3 fadeCol = vec3(0.00, 0.35, 0.14);   // deep at rim=0
+    vec3 col     = mix(fadeCol, edgeCol, glow);
+    // mist wisps slightly brighter
+    col = mix(col, vec3(0.15, 1.0, 0.55), mist / max(finalAlpha, 0.001));
 
-    gl_FragColor = vec4(col, alpha);
+    gl_FragColor = vec4(col, finalAlpha);
   }
 `
 
-/**
- * buildAtmosphere — single shell, returns mat so animate loop ticks uTime.
- */
 function buildAtmosphere(scene) {
   const mat = new THREE.ShaderMaterial({
     uniforms:      { uTime: { value: 0.0 } },
     vertexShader:   ATMO_VERT,
     fragmentShader: ATMO_FRAG,
-    side:        THREE.BackSide,
+    side:        THREE.FrontSide,       // FrontSide: rim=1 IS the silhouette edge
     blending:    THREE.AdditiveBlending,
     transparent: true,
     depthWrite:  false,
+    depthTest:   false,                 // render on top of globe, no z-fighting
   })
+  // Shell sits just outside the globe surface — the visible ring
+  // is exactly at the circumference, haze fans outward from there.
   scene.add(new THREE.Mesh(new THREE.SphereGeometry(R * 1.5, 64, 64), mat))
   return mat
 }
@@ -575,10 +583,7 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
 
     buildStars(scene)
     buildGlobe(scene)
-
-    // ONE atmosphere shell — unified glow + mist in a single shader
-    const atmoMat = buildAtmosphere(scene)
-
+    const atmoMat = buildAtmosphere(scene)  // single FrontSide shell
     const labelObjects = buildLabels3D(scene)
     buildCountryBorders(scene)
 
@@ -595,7 +600,6 @@ function ThreeGlobe({ filteredArcs, isRotating, speedLevel }) {
     window.addEventListener('resize', onResize)
 
     const clock = new THREE.Clock()
-
     let rafId
     const animate = () => {
       rafId = requestAnimationFrame(animate)
