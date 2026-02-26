@@ -138,3 +138,187 @@ html, body, #root {
   50%       { border-color: rgba(191,95,255,0.5); }
 }
 .border-pulse-purple { animation: borderPulsePurple 3s ease-in-out infinite; }
+
+/* ========================================================
+   GLOBE — deep space radial vignette (KK-inspired)
+   ======================================================== */
+.globe-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: radial-gradient(
+    ellipse at 50% 50%,
+    #050907 55%,
+    #010503 100%
+  );
+}
+
+/* ========================================================
+   GLOBE — attack intensity pulse ring
+   Activate by adding class "attacking" to .globe-container
+   ======================================================== */
+@keyframes glowPulse {
+  0%   { box-shadow: 0 0 20px 4px  rgba(0,255,136,0.10); }
+  50%  { box-shadow: 0 0 48px 14px rgba(0,255,136,0.22); }
+  100% { box-shadow: 0 0 20px 4px  rgba(0,255,136,0.10); }
+}
+.globe-container.attacking {
+  animation: glowPulse 2.4s ease-in-out infinite;
+  border-radius: 50%;
+}
+
+/* Critical-level attack — stronger red pulse */
+@keyframes glowPulseCrit {
+  0%   { box-shadow: 0 0 20px 4px  rgba(255,51,102,0.12); }
+  50%  { box-shadow: 0 0 56px 18px rgba(255,51,102,0.28); }
+  100% { box-shadow: 0 0 20px 4px  rgba(255,51,102,0.12); }
+}
+.globe-container.attacking-critical {
+  animation: glowPulseCrit 1.6s ease-in-out infinite;
+  border-radius: 50%;
+}
+
+/* ========================================================
+   SELECTED COUNTRY NAME LABEL (KK exact style)
+   ======================================================== */
+.selected-country-name {
+  display: block;
+  position: absolute;
+  width: 100%;
+  height: 20px;
+  top: 10px;
+  left: 0;
+  z-index: 5;
+  text-align: center;
+  text-shadow: 0 0 0.5em #88ff77;
+  color: #93e2bc;
+  font-size: 20px;
+  text-transform: uppercase;
+  pointer-events: none;
+  font-family: 'JetBrains Mono', monospace;
+  letter-spacing: 0.12em;
+}
+
+/* ========================================================
+   ATTACK ARC / MISSILE TRAIL — SVG drop-shadow glow
+   ======================================================== */
+.arc-line,
+.missile-trail {
+  filter: drop-shadow(0 0 3px rgba(0,255,136,0.75));
+}
+.arc-line.critical,
+.missile-trail.critical {
+  filter: drop-shadow(0 0 5px rgba(255,51,102,0.85));
+}
+
+/* ========================================================
+   STAT PANELS — terminal monospace readout
+   ======================================================== */
+.stat-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--c-green);
+  text-shadow: 0 0 10px rgba(0,255,136,0.5);
+}
+
+.stat-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: rgba(0,255,136,0.55);
+}
+
+/* ========================================================
+   COUNTRY POPUP — KK dark glass style
+   ======================================================== */
+.country-popup {
+  background-color: #17201c;
+  border: 1px solid #456e59;
+  color: #456e59;
+  font-family: 'JetBrains Mono', 'Ubuntu Mono', monospace;
+}
+
+.country-popup-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 1.2rem;
+  color: #cce8d9;
+  letter-spacing: 0.08em;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* ========================================================
+   DETECTION TYPE LABELS — monospace terminal look
+   ======================================================== */
+.detection-type-label {
+  font-family: 'JetBrains Mono', 'Ubuntu Mono', monospace;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.10em;
+  color: #456e59;
+}
+
+/* ========================================================
+   MAP CONTROLS — KK style hover
+   ======================================================== */
+.map-control-btn {
+  background-color: #19241e;
+  width: 30px;
+  height: 30px;
+  cursor: pointer;
+  transition: background-color 0.1s ease-in-out;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 2px;
+}
+.map-control-btn:hover {
+  background-color: #2e3633;
+}
+
+/* ========================================================
+   HEADER / FOOTER BORDERS — KK exact
+   ======================================================== */
+.site-header {
+  border-bottom: 1px solid #19241e;
+  background-color: #050907;
+}
+.site-footer {
+  border-top: 1px solid #19241e;
+  background-color: #050907;
+}
+
+/* ========================================================
+   TRAFFIC SPARKLINE — subtle green line chart
+   ======================================================== */
+.sparkline {
+  stroke: #00ff88;
+  stroke-width: 1.5;
+  fill: none;
+  filter: drop-shadow(0 0 2px rgba(0,255,136,0.6));
+}
+.sparkline-area {
+  fill: url(#sparkGradient);
+  opacity: 0.18;
+}
+
+/* ========================================================
+   TOOLTIP
+   ======================================================== */
+.tooltip {
+  background: rgba(6,15,8,0.95);
+  border: 1px solid rgba(0,255,136,0.25);
+  color: #c8ffd9;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  padding: 6px 10px;
+  border-radius: 4px;
+  pointer-events: none;
+  backdrop-filter: blur(8px);
+  box-shadow: 0 0 12px rgba(0,255,136,0.1);
+}
